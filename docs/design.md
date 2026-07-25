@@ -153,6 +153,9 @@ for normal use.
 - `connectTimeout`: 5 seconds.
 - `operationTimeout`: 2 seconds.
 - `memoryMaxEntries`: 4096.
+- `pubSubMaxPendingMessages`: 1024 per subscription. When a handler is
+  slower than delivery and its queue is full, new payloads are dropped for
+  that subscription; publish acceptance and counts are unchanged.
 - `onHandlerError`: nil/no-op. The library has no logging dependency.
 - `ttlSeconds == 0`: no expiry.
 - `ttlSeconds < 0`: `InvalidArgumentError`.
@@ -199,7 +202,10 @@ must redact credentials and command payloads.
 
 - Each active subscription receives messages for its exact channel only.
 - Multiple subscriptions to the same channel each receive the message once.
-- Publish with no subscribers succeeds and returns zero.
+- A successful publish returns the number of active local subscriptions on
+  that `PubSub` instance for the exact channel. External Redis clients do not
+  affect this backend-neutral result. Publish with no local subscribers
+  succeeds and returns zero.
 - `unsubscribe` stops future delivery and is idempotent.
 - Delivery is at-most-once and ephemeral; history is never retained.
 - Order is preserved per publisher connection and subscription.

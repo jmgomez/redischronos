@@ -47,3 +47,37 @@ suite "memory Pub/Sub internals":
       await bus.close()
       check terminated
     waitFor exercise()
+
+  test "delivery queues are bounded and unsubscribe discards queued payloads":
+    proc exercise() {.async.} =
+      var options = defaultBackendOptions()
+      options.pubSubMaxPendingMessages = 2
+      let bus = await openPubSub("mem://", options)
+      let release = newFuture[void]("release slow handler")
+      var received: seq[string]
+      let handler: MessageHandler =
+        proc(channel, payload: string): Future[void] {.async.} =
+          received.add(payload)
+          if payload == "first":
+            await release
+      let subscription = await bus.subscribe("events", handler)
+      for payload in ["first", "second", "third", "dropped"]:
+        discard await bus.publish("events", payload)
+      await bus.unsubscribe(subscription)
+      release.complete()
+      await sleepAsync(10.milliseconds)
+      check received == @["first"]
+      await bus.close()
+    waitFor exercise()
+
+  test "a stuck state observer cannot block close":
+    proc exercise() {.async.} =
+      var options = defaultBackendOptions()
+      options.operationTimeout = 20.milliseconds
+      let bus = await openPubSub("mem://", options)
+      let handler: StateHandler =
+        proc(state: ConnectionState): Future[void] {.async.} =
+          await sleepAsync(1.hours)
+      bus.onStateChange(handler)
+      await bus.close().wait(100.milliseconds)
+    waitFor exercise()

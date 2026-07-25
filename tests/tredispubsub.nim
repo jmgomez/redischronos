@@ -15,6 +15,22 @@ when defined(redisIntegration):
   pubSubContractSuite("Redis", openRedisPubSub)
 
   suite "Redis Pub/Sub mappings":
+    test "other Redis clients do not affect the portable publish count":
+      proc exercise() {.async.} =
+        let first = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let other = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let handler: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            discard
+        let local = await first.subscribe("redischronos:counts", handler)
+        let external = await other.subscribe("redischronos:counts", handler)
+        check (await first.publish("redischronos:counts", "payload")) == 1
+        await first.unsubscribe(local)
+        await other.unsubscribe(external)
+        await first.close()
+        await other.close()
+      waitFor exercise()
+
     test "multiple local handlers share one server subscription":
       proc exercise() {.async.} =
         let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
@@ -29,7 +45,7 @@ when defined(redisIntegration):
           await bus.subscribe("redischronos:shared", firstHandler)
         let secondSubscription =
           await bus.subscribe("redischronos:shared", secondHandler)
-        check (await bus.publish("redischronos:shared", "one")) == 1
+        check (await bus.publish("redischronos:shared", "one")) == 2
         await sleepAsync(20.milliseconds)
         check first == 1
         check second == 1
@@ -101,4 +117,37 @@ when defined(redisIntegration):
           await sleepAsync(10.milliseconds)
         check disconnected
         await bus.close().wait(500.milliseconds)
+      waitFor exercise()
+
+    test "state observers cannot block reconnect or close":
+      proc exercise() {.async.} =
+        var options = defaultBackendOptions()
+        options.operationTimeout = 30.milliseconds
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"), options)
+        let stuck: StateHandler =
+          proc(state: ConnectionState): Future[void] {.async.} =
+            await sleepAsync(1.hours)
+        bus.onStateChange(stuck)
+        await bus.disconnectSubscriberForTest()
+        await sleepAsync(150.milliseconds)
+        await bus.close().wait(150.milliseconds)
+      waitFor exercise()
+
+    test "injected reconnect jitter is capped and exercised":
+      proc exercise() {.async.} =
+        var calls: seq[int]
+        var options = defaultBackendOptions()
+        options.reconnectJitterSource =
+          proc(maxInclusive: int): int {.gcsafe, raises: [].} =
+            calls.add(maxInclusive)
+            maxInclusive + 100
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"), options)
+        await bus.disconnectSubscriberForTest()
+        for _ in 0 ..< 100:
+          if calls.len > 0:
+            break
+          await sleepAsync(10.milliseconds)
+        check calls.len > 0
+        check calls[0] > 0
+        await bus.close()
       waitFor exercise()

@@ -73,6 +73,22 @@ template kvContractSuite*(backendName: string, factory: KvFactory) =
         await store.close()
       waitFor exercise()
 
+    test "increment preserves an existing TTL":
+      proc exercise() {.async.} =
+        let store = await factory()
+        await store.set("expiring-contract-counter", "1", 1)
+        check (await store.increment("expiring-contract-counter")) == 2
+        await sleepAsync(1100.milliseconds)
+        check (await store.get("expiring-contract-counter")).isNone
+
+        for value in ["invalid", $high(int64)]:
+          await store.set("expiring-contract-counter", value, 1)
+          expect RedisCommandError:
+            discard await store.increment("expiring-contract-counter")
+          check (await store.get("expiring-contract-counter")) == some(value)
+        await store.close()
+      waitFor exercise()
+
     test "close is idempotent and later operations fail":
       let store = waitFor factory()
       waitFor store.close()

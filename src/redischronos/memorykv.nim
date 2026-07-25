@@ -143,8 +143,10 @@ method increment*(store: InMemoryKvStore, key: string): Future[int64] {.async.} 
     )
 
   result = current + 1
+  let expiresAt = store.entries[key].expiresAt
   store.entries[key] = Entry(
     value: $result,
+    expiresAt: expiresAt,
     lastAccess: store.nextAccess()
   )
 

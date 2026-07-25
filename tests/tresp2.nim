@@ -1,4 +1,4 @@
-import std/unittest
+import std/[strutils, unittest]
 import redischronos/errors
 import redischronos/resp2
 
@@ -102,3 +102,33 @@ suite "RESP2 incremental parser":
     discard parser.feed("$8\r\n")
     expect ProtocolError:
       discard parser.feed("123456789")
+
+  test "inline limits are invariant to fragmentation":
+    let validFrames = [
+      "+" & repeat("x", 128) & "\r\n",
+      "-ERR " & repeat("failure ", 20) & "\r\n",
+      ":9223372036854775807\r\n",
+      "$128\r\n" & repeat("x", 128) & "\r\n"
+    ]
+    for frame in validFrames:
+      let whole = newRespParser(maxInlineBytes = 256).feed(frame)
+      for boundary in 0 .. frame.len:
+        let parser = newRespParser(maxInlineBytes = 256)
+        var fragmented = parser.feed(frame[0 ..< boundary])
+        fragmented.add(parser.feed(frame[boundary ..< frame.len]))
+        check fragmented == whole
+
+      let byteParser = newRespParser(maxInlineBytes = 256)
+      var byteValues: seq[RespValue]
+      for character in frame:
+        byteValues.add(byteParser.feed($character))
+      check byteValues == whole
+
+    for fragments in [
+      @["+" & repeat("x", 17), "\r\n"],
+      @["+" & repeat("x", 8), repeat("x", 9) & "\r\n"]
+    ]:
+      let parser = newRespParser(maxInlineBytes = 16)
+      expect ProtocolError:
+        for fragment in fragments:
+          discard parser.feed(fragment)

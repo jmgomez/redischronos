@@ -180,6 +180,47 @@ suite "serialized Redis connection":
       await server.closeServer()
     waitFor exercise()
 
+  test "close is terminal for commands already queued on the lock":
+    proc exercise() {.async.} =
+      let server = startServer()
+      let connection = newRedisConnection(configFor(server))
+      let commandReceived = newFuture[void]("command A received")
+      let releaseCommand = newFuture[void]("release command A")
+      var receivedAfterClose = false
+      let serverTask = proc() {.async.} =
+        let client = await server.clients.popFirst()
+        let parser = newRespParser()
+        discard await readFrame(client, parser)
+        discard await client.write("+PONG\r\n")
+        check commandName(await readFrame(client, parser)) == "A"
+        commandReceived.complete()
+        await releaseCommand
+        discard await client.write(":1\r\n")
+        try:
+          discard await readFrame(client, parser).wait(50.milliseconds)
+          receivedAfterClose = true
+        except AsyncTimeoutError, ValueError, TransportError:
+          discard
+        await client.closeWait()
+
+      let serving = serverTask()
+      let first = connection.execute(["A"])
+      await commandReceived
+      let queued = connection.execute(["B"])
+      let closing = connection.close()
+      releaseCommand.complete()
+      check (await first) == integerValue(1)
+      await closing.wait(500.milliseconds)
+      expect BackendClosedError:
+        discard await queued
+      expect BackendClosedError:
+        discard await connection.execute(["C"])
+      check not receivedAfterClose
+      await connection.close()
+      await serving
+      await server.closeServer()
+    waitFor exercise()
+
   test "disconnect fails the current command and the next command reconnects":
     proc exercise() {.async.} =
       let server = startServer()
@@ -230,4 +271,74 @@ suite "serialized Redis connection":
       await connection.close()
       await serving
       await server.closeServer()
+    waitFor exercise()
+
+  test "cancelling a queued waiter preserves the active command":
+    proc exercise() {.async.} =
+      let server = startServer()
+      let connection = newRedisConnection(configFor(server))
+      let activeReceived = newFuture[void]("active command received")
+      let releaseActive = newFuture[void]("release active command")
+      let serverTask = proc() {.async.} =
+        let client = await server.clients.popFirst()
+        let parser = newRespParser()
+        discard await readFrame(client, parser)
+        discard await client.write("+PONG\r\n")
+        check commandName(await readFrame(client, parser)) == "ACTIVE"
+        activeReceived.complete()
+        await releaseActive
+        discard await client.write(":1\r\n")
+        check commandName(await readFrame(client, parser)) == "AFTER"
+        discard await client.write(":2\r\n")
+        await client.closeWait()
+
+      let serving = serverTask()
+      let active = connection.execute(["ACTIVE"])
+      await activeReceived
+      let waiter = connection.execute(["WAITER"])
+      waiter.cancelSoon()
+      expect CancelledError:
+        discard await waiter
+      releaseActive.complete()
+      check (await active) == integerValue(1)
+      check (await connection.execute(["AFTER"])) == integerValue(2)
+      await connection.close()
+      await serving
+      await server.closeServer()
+    waitFor exercise()
+
+  test "surplus replies close a non-pipelined connection":
+    proc exercise() {.async.} =
+      let server = startServer()
+      let connection = newRedisConnection(configFor(server))
+      let serverTask = proc() {.async.} =
+        let client = await server.clients.popFirst()
+        let parser = newRespParser()
+        discard await readFrame(client, parser)
+        discard await client.write("+PONG\r\n")
+        discard await readFrame(client, parser)
+        discard await client.write(":1\r\n:2\r\n")
+        await client.closeWait()
+      let serving = serverTask()
+      expect ProtocolError:
+        discard await connection.execute(["ONE"])
+      await connection.close()
+      await serving
+      await server.closeServer()
+    waitFor exercise()
+
+  test "resolution failures are typed and the command deadline is total":
+    proc exercise() {.async.} =
+      var options = defaultBackendOptions()
+      options.operationTimeout = 50.milliseconds
+      options.connectTimeout = 1.seconds
+      let connection = newRedisConnection(
+        RedisConfig(host: "definitely-missing.invalid", port: 6379),
+        options
+      )
+      let started = Moment.now()
+      expect BackendConnectionError:
+        discard await connection.execute(["PING"])
+      check Moment.now() - started < 1.seconds
+      await connection.close()
     waitFor exercise()

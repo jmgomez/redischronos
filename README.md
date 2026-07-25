@@ -66,7 +66,12 @@ waitFor main()
 
 Publishing is ephemeral and at-most-once. Publish completion means the backend
 accepted the message; handlers run asynchronously. Delivery order is preserved
-per subscription.
+per subscription. A successful publish returns the number of active matching
+subscriptions on that `PubSub` instance; subscriptions owned by other Redis
+clients do not affect this portable result.
+Each subscription queues at most `BackendOptions.pubSubMaxPendingMessages`
+payloads (1024 by default); newer payloads are dropped for a full slow-handler
+queue so memory use remains bounded.
 
 ## Errors and connection state
 

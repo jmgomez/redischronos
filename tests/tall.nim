@@ -10,6 +10,7 @@ import ./tredisurl
 import ./tredisconnection
 import ./trediskv
 import ./tredispubsub
+import ./tredisoutage
 
 suite "public contracts":
   test "exposes the stable release version":
@@ -20,6 +21,8 @@ suite "public contracts":
     check options.connectTimeout == 5.seconds
     check options.operationTimeout == 2.seconds
     check options.memoryMaxEntries == 4096
+    check options.pubSubMaxPendingMessages == 1024
+    check options.reconnectJitterSource == nil
     check options.onHandlerError == nil
 
   test "all public failures share one typed base":

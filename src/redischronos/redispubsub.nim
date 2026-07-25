@@ -1,4 +1,4 @@
-import std/[options, random, tables]
+import std/[deques, options, random, sequtils, tables]
 import chronos
 
 import ./api
@@ -14,7 +14,7 @@ type
     channel: string
     handler: MessageHandler
     active: bool
-    queue: seq[string]
+    queue: Deque[string]
     worker: Future[void]
     owner: RedisPubSub
 
@@ -35,10 +35,17 @@ type
     isClosed: bool
     connected: bool
     currentStateHandler: StateHandler
-    stateTask: Future[void]
+    stateQueue: Deque[ConnectionState]
+    stateWorker: Future[void]
+    rng: Rand
 
 proc writeSubscriber(bus: RedisPubSub,
-    arguments: openArray[string]): Future[void] {.gcsafe.}
+    arguments: openArray[string],
+    deadline: Moment): Future[void] {.gcsafe.}
+
+proc remaining(deadline: Moment): Duration =
+  let now = Moment.now()
+  if deadline <= now: 0.nanoseconds else: deadline - now
 
 proc bytesToString(bytes: seq[byte]): string =
   result = newString(bytes.len)
@@ -148,20 +155,27 @@ proc connectSubscriber(config: RedisConfig,
     raise
   return (transport, parser)
 
-proc notifyState(bus: RedisPubSub,
-    state: ConnectionState): Future[void] {.async.} =
-  if bus.currentStateHandler != nil:
-    try:
-      await bus.currentStateHandler(state)
-    except CancelledError:
-      raise
-    except CatchableError:
-      discard
+proc observeStates(bus: RedisPubSub) {.async.} =
+  while bus.stateQueue.len > 0:
+    let state = bus.stateQueue.popFirst()
+    if bus.currentStateHandler != nil:
+      try:
+        await bus.currentStateHandler(state)
+      except CancelledError:
+        raise
+      except CatchableError:
+        discard
+
+proc notifyState(bus: RedisPubSub, state: ConnectionState) =
+  bus.stateQueue.addLast(state)
+  if bus.stateWorker == nil or bus.stateWorker.finished:
+    bus.stateWorker = bus.observeStates()
 
 proc deliver(subscription: RedisSubscription) {.async.} =
-  while subscription.queue.len > 0:
-    let payload = subscription.queue[0]
-    subscription.queue.delete(0)
+  while subscription.active and subscription.queue.len > 0:
+    let payload = subscription.queue.popFirst()
+    if not subscription.active:
+      break
     try:
       await subscription.handler(subscription.channel, payload)
     except CancelledError:
@@ -180,7 +194,9 @@ proc dispatch(bus: RedisPubSub, channel, payload: string) =
   let snapshot = bus.channels[channel]
   for subscription in snapshot:
     if subscription.active:
-      subscription.queue.add(payload)
+      if subscription.queue.len <
+          bus.options.pubSubMaxPendingMessages:
+        subscription.queue.addLast(payload)
       if subscription.worker == nil or subscription.worker.finished:
         subscription.worker = deliver(subscription)
 
@@ -223,36 +239,100 @@ proc hasDesiredChannel(bus: RedisPubSub, channel: string): bool =
     if subscription.active:
       return true
 
-proc resubscribe(bus: RedisPubSub) {.async.} =
+proc desiredChannels(bus: RedisPubSub): seq[string] =
+  for channel in bus.channels.keys:
+    if bus.hasDesiredChannel(channel):
+      result.add(channel)
+
+proc waitForChannelState(bus: RedisPubSub, transport: StreamTransport,
+    parser: RespParser, channel: string, subscribed: bool) {.async.} =
+  let operation = proc() {.async.} =
+    while bus.liveChannels.hasKey(channel) != subscribed:
+      let values = parser.feed(await transport.readSome())
+      for value in values:
+        bus.handleFrame(value)
+  let waiting = operation()
+  try:
+    await waiting.wait(bus.options.operationTimeout)
+  except AsyncTimeoutError:
+    await waiting.cancelAndWait()
+    raise newException(
+      BackendTimeoutError,
+      "Redis subscription acknowledgement timed out"
+    )
+
+proc writeCandidateImpl(bus: RedisPubSub, transport: StreamTransport,
+    arguments: seq[string]) {.async.} =
+  let writing = transport.write(encodeCommand(arguments))
+  try:
+    discard await writing.wait(bus.options.operationTimeout)
+  except AsyncTimeoutError:
+    await writing.cancelAndWait()
+    raise newException(BackendTimeoutError, "Redis subscriber write timed out")
+
+proc writeCandidate(bus: RedisPubSub, transport: StreamTransport,
+    arguments: openArray[string]): Future[void] =
+  bus.writeCandidateImpl(transport, @arguments)
+
+proc reconcileCandidate(bus: RedisPubSub, transport: StreamTransport,
+    parser: RespParser) {.async.} =
   while true:
-    var changed = false
-    for channel in bus.channels.keys:
-      if bus.hasDesiredChannel(channel) and
-          not bus.liveChannels.hasKey(channel):
-        await bus.writeSubscriber(["SUBSCRIBE", channel])
-        bus.handleFrame(await bus.subscriber.readOne(bus.parser))
-        changed = true
-    if not changed:
-      break
+    let desired = bus.desiredChannels()
+    for channel in desired:
+      if not bus.liveChannels.hasKey(channel):
+        await bus.writeCandidate(transport, ["SUBSCRIBE", channel])
+        await bus.waitForChannelState(transport, parser, channel, true)
+
+    var stale: seq[string]
+    for channel in bus.liveChannels.keys:
+      if channel notin bus.desiredChannels():
+        stale.add(channel)
+    for channel in stale:
+      await bus.writeCandidate(transport, ["UNSUBSCRIBE", channel])
+      await bus.waitForChannelState(transport, parser, channel, false)
+
+    let currentDesired = bus.desiredChannels()
+    var converged = currentDesired.len == bus.liveChannels.len
+    if converged:
+      for channel in currentDesired:
+        if not bus.liveChannels.hasKey(channel):
+          converged = false
+    if converged:
+      return
 
 proc reconnect(bus: RedisPubSub) {.async.} =
   var attempt = 0
   while not bus.isClosed:
     let baseMilliseconds = min(1000, 50 * (1 shl min(attempt, 4)))
-    let jitterMilliseconds = rand(max(1, baseMilliseconds div 4))
+    let jitterCap = max(1, baseMilliseconds div 4)
+    let jitterMilliseconds =
+      if bus.options.reconnectJitterSource != nil:
+        clamp(bus.options.reconnectJitterSource(jitterCap), 0, jitterCap)
+      else:
+        bus.rng.rand(jitterCap)
     await sleepAsync((baseMilliseconds + jitterMilliseconds).milliseconds)
     if bus.isClosed:
       return
     try:
-      let (subscriber, parser) =
+      let (candidate, candidateParser) =
         await connectSubscriber(bus.config, bus.options)
-      bus.subscriber = subscriber
-      bus.parser = parser
-      bus.liveChannels.clear()
-      await bus.resubscribe()
-      bus.connected = true
-      await bus.notifyState(csConnected)
-      return
+      try:
+        bus.liveChannels.clear()
+        await bus.reconcileCandidate(candidate, candidateParser)
+        bus.subscriber = candidate
+        bus.parser = candidateParser
+        bus.connected = true
+        bus.notifyState(csConnected)
+        return
+      except CancelledError:
+        candidate.close()
+        await candidate.closeWait()
+        raise
+      except CatchableError:
+        candidate.close()
+        await candidate.closeWait()
+        bus.liveChannels.clear()
+        raise
     except CancelledError:
       raise
     except CatchableError:
@@ -279,11 +359,16 @@ proc readerLoop(bus: RedisPubSub) {.async.} =
           acknowledgement.fail(error)
       if bus.subscriber != nil:
         await bus.subscriber.closeWait()
-      await bus.notifyState(csDisconnected)
+      bus.notifyState(csDisconnected)
       await bus.reconnect()
 
 proc newRedisPubSub*(url: string,
     options = defaultBackendOptions()): Future[PubSub] {.async.} =
+  if options.pubSubMaxPendingMessages <= 0:
+    raise newException(
+      InvalidArgumentError,
+      "pubSubMaxPendingMessages must be positive"
+    )
   let config = parseRedisUrl(url)
   let (subscriber, parser) = await connectSubscriber(config, options)
   let bus = RedisPubSub(
@@ -297,7 +382,8 @@ proc newRedisPubSub*(url: string,
     subscribeAcks: initTable[string, Future[void]](),
     unsubscribeAcks: initTable[string, Future[void]](),
     liveChannels: initTable[string, bool](),
-    connected: true
+    connected: true,
+    rng: initRand()
   )
   bus.reader = bus.readerLoop()
   return bus
@@ -307,21 +393,42 @@ proc requireOpen(bus: RedisPubSub) =
     raise newException(BackendClosedError, "pub/sub backend is closed")
 
 proc writeSubscriberImpl(bus: RedisPubSub,
-    arguments: seq[string]) {.async.} =
+    arguments: seq[string], deadline: Moment) {.async.} =
   let acquiring = bus.writeLock.acquire()
+  var acquired = false
   try:
-    await acquiring.wait(bus.options.operationTimeout)
+    let budget = deadline.remaining()
+    if budget <= 0.nanoseconds:
+      raise newException(BackendTimeoutError, "Redis subscriber write timed out")
+    await acquiring.wait(budget)
+    acquired = true
   except AsyncTimeoutError:
     await acquiring.cancelAndWait()
     raise newException(BackendTimeoutError, "Redis subscriber write timed out")
   try:
-    discard await bus.subscriber.write(encodeCommand(arguments))
+    let writing = bus.subscriber.write(encodeCommand(arguments))
+    try:
+      let budget = deadline.remaining()
+      if budget <= 0.nanoseconds:
+        raise newException(
+          BackendTimeoutError,
+          "Redis subscriber write timed out"
+        )
+      discard await writing.wait(budget)
+    except AsyncTimeoutError:
+      await writing.cancelAndWait()
+      raise newException(
+        BackendTimeoutError,
+        "Redis subscriber write timed out"
+      )
   finally:
-    bus.writeLock.release()
+    if acquired:
+      bus.writeLock.release()
 
 proc writeSubscriber(bus: RedisPubSub,
-    arguments: openArray[string]): Future[void] {.gcsafe.} =
-  bus.writeSubscriberImpl(@arguments)
+    arguments: openArray[string],
+    deadline: Moment): Future[void] {.gcsafe.} =
+  bus.writeSubscriberImpl(@arguments, deadline)
 
 method subscribe*(bus: RedisPubSub, channel: string,
     handler: MessageHandler): Future[Subscription] {.async.} =
@@ -345,11 +452,49 @@ method subscribe*(bus: RedisPubSub, channel: string,
       return subscription
     let acknowledgement = newFuture[void]("RedisPubSub.subscribe")
     bus.subscribeAcks[channel] = acknowledgement
-    await bus.writeSubscriber(["SUBSCRIBE", channel])
+    let deadline = Moment.now() + bus.options.operationTimeout
     try:
-      await acknowledgement.wait(bus.options.operationTimeout)
+      await bus.writeSubscriber(["SUBSCRIBE", channel], deadline)
+      let budget = deadline.remaining()
+      if budget <= 0.nanoseconds:
+        raise newException(BackendTimeoutError, "Redis subscribe timed out")
+      await acknowledgement.wait(budget)
     except AsyncTimeoutError:
+      if bus.subscribeAcks.hasKey(channel):
+        bus.subscribeAcks.del(channel)
+      subscription.active = false
+      subscription.queue.clear()
+      bus.subscriptions.keepItIf(it != subscription)
+      bus.channels[channel].keepItIf(it != subscription)
+      if bus.channels[channel].len == 0:
+        bus.channels.del(channel)
+      if bus.subscriber != nil:
+        bus.subscriber.close()
       raise newException(BackendTimeoutError, "Redis subscribe timed out")
+    except CancelledError:
+      if bus.subscribeAcks.hasKey(channel):
+        bus.subscribeAcks.del(channel)
+      subscription.active = false
+      subscription.queue.clear()
+      bus.subscriptions.keepItIf(it != subscription)
+      bus.channels[channel].keepItIf(it != subscription)
+      if bus.channels[channel].len == 0:
+        bus.channels.del(channel)
+      if bus.subscriber != nil:
+        bus.subscriber.close()
+      raise
+    except CatchableError:
+      if bus.subscribeAcks.hasKey(channel):
+        bus.subscribeAcks.del(channel)
+      subscription.active = false
+      subscription.queue.clear()
+      bus.subscriptions.keepItIf(it != subscription)
+      bus.channels[channel].keepItIf(it != subscription)
+      if bus.channels[channel].len == 0:
+        bus.channels.del(channel)
+      if bus.subscriber != nil:
+        bus.subscriber.close()
+      raise
   return subscription
 
 method unsubscribe*(bus: RedisPubSub,
@@ -361,20 +506,51 @@ method unsubscribe*(bus: RedisPubSub,
   if redisSubscription.owner != bus or not redisSubscription.active:
     return
   redisSubscription.active = false
+  redisSubscription.queue.clear()
   var remaining = false
   for item in bus.channels[redisSubscription.channel]:
     if item.active:
       remaining = true
+  bus.subscriptions.keepItIf(it != redisSubscription)
+  if bus.channels.hasKey(redisSubscription.channel):
+    bus.channels[redisSubscription.channel].keepItIf(
+      it != redisSubscription
+    )
+    if bus.channels[redisSubscription.channel].len == 0:
+      bus.channels.del(redisSubscription.channel)
   if not remaining:
     if not bus.connected:
       return
     let acknowledgement = newFuture[void]("RedisPubSub.unsubscribe")
     bus.unsubscribeAcks[redisSubscription.channel] = acknowledgement
-    await bus.writeSubscriber(["UNSUBSCRIBE", redisSubscription.channel])
+    let deadline = Moment.now() + bus.options.operationTimeout
     try:
-      await acknowledgement.wait(bus.options.operationTimeout)
+      await bus.writeSubscriber(
+        ["UNSUBSCRIBE", redisSubscription.channel],
+        deadline
+      )
+      let budget = deadline.remaining()
+      if budget <= 0.nanoseconds:
+        raise newException(BackendTimeoutError, "Redis unsubscribe timed out")
+      await acknowledgement.wait(budget)
     except AsyncTimeoutError:
+      if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
+        bus.unsubscribeAcks.del(redisSubscription.channel)
+      if bus.subscriber != nil:
+        bus.subscriber.close()
       raise newException(BackendTimeoutError, "Redis unsubscribe timed out")
+    except CancelledError:
+      if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
+        bus.unsubscribeAcks.del(redisSubscription.channel)
+      if bus.subscriber != nil:
+        bus.subscriber.close()
+      raise
+    except CatchableError:
+      if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
+        bus.unsubscribeAcks.del(redisSubscription.channel)
+      if bus.subscriber != nil:
+        bus.subscriber.close()
+      raise
 
 method publish*(bus: RedisPubSub, channel,
     payload: string): Future[int64] {.async.} =
@@ -385,7 +561,10 @@ method publish*(bus: RedisPubSub, channel,
     await bus.publishConnection.execute(["PUBLISH", channel, payload])
   if reply.kind != rkInteger:
     raise newException(ProtocolError, "unexpected Redis PUBLISH reply")
-  return reply.integer
+  if bus.channels.hasKey(channel):
+    for subscription in bus.channels[channel]:
+      if subscription.active:
+        inc result
 
 method onStateChange*(bus: RedisPubSub,
     handler: StateHandler) {.gcsafe.} =
@@ -394,12 +573,22 @@ method onStateChange*(bus: RedisPubSub,
     if bus.isClosed: csClosed
     elif bus.connected: csConnected
     else: csDisconnected
-  bus.stateTask = bus.notifyState(state)
+  bus.notifyState(state)
 
 method close*(bus: RedisPubSub): Future[void] {.async.} =
   if bus.isClosed:
     return
   bus.isClosed = true
+  let closedError =
+    newException(BackendClosedError, "pub/sub backend is closed")
+  for _, acknowledgement in bus.subscribeAcks.pairs:
+    if not acknowledgement.finished:
+      acknowledgement.fail(closedError)
+  for _, acknowledgement in bus.unsubscribeAcks.pairs:
+    if not acknowledgement.finished:
+      acknowledgement.fail(closedError)
+  bus.subscribeAcks.clear()
+  bus.unsubscribeAcks.clear()
   for subscription in bus.subscriptions:
     subscription.active = false
     if subscription.worker != nil and not subscription.worker.finished:
@@ -409,9 +598,12 @@ method close*(bus: RedisPubSub): Future[void] {.async.} =
   if bus.subscriber != nil:
     await bus.subscriber.closeWait()
   await bus.publishConnection.close()
-  if bus.stateTask != nil and not bus.stateTask.finished:
-    await bus.stateTask
-  await bus.notifyState(csClosed)
+  bus.notifyState(csClosed)
+  if bus.stateWorker != nil and not bus.stateWorker.finished:
+    try:
+      await bus.stateWorker.wait(bus.options.operationTimeout)
+    except AsyncTimeoutError:
+      await bus.stateWorker.cancelAndWait()
 
 when defined(test):
   proc disconnectSubscriberForTest*(bus: PubSub) {.async.} =

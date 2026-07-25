@@ -29,6 +29,7 @@ type
     maxArrayLength: int
     maxDepth: int
     maxBufferBytes: int
+    maxInlineBytes: int
 
   ParseStatus = enum
     psIncomplete, psComplete
@@ -108,15 +109,17 @@ proc encodeCommand*(arguments: openArray[string]): string =
 
 proc newRespParser*(maxBulkBytes = 16 * 1024 * 1024,
     maxArrayLength = 1024, maxDepth = 32,
-    maxBufferBytes = 32 * 1024 * 1024): RespParser =
+    maxBufferBytes = 32 * 1024 * 1024,
+    maxInlineBytes = 64 * 1024): RespParser =
   if maxBulkBytes < 0 or maxArrayLength < 0 or maxDepth < 0 or
-      maxBufferBytes < 0:
+      maxBufferBytes < 0 or maxInlineBytes < 0:
     raise newException(ProtocolError, "RESP parser limits must not be negative")
   RespParser(
     maxBulkBytes: maxBulkBytes,
     maxArrayLength: maxArrayLength,
     maxDepth: maxDepth,
-    maxBufferBytes: maxBufferBytes
+    maxBufferBytes: maxBufferBytes,
+    maxInlineBytes: maxInlineBytes
   )
 
 proc parseLine(parser: RespParser, position: int,
@@ -124,11 +127,13 @@ proc parseLine(parser: RespParser, position: int,
   var index = position
   while index + 1 < parser.buffer.len:
     if parser.buffer[index] == '\r' and parser.buffer[index + 1] == '\n':
+      if index - position > parser.maxInlineBytes:
+        raise newException(ProtocolError, "RESP line exceeds parser limit")
       line = parser.buffer[position ..< index]
       nextPosition = index + 2
       return psComplete
     inc index
-  if parser.buffer.len - position > 64:
+  if parser.buffer.len - position > parser.maxInlineBytes:
     raise newException(ProtocolError, "RESP line exceeds parser limit")
   psIncomplete
 

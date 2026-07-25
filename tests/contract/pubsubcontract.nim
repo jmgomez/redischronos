@@ -5,7 +5,34 @@ import redischronos
 type PubSubFactory* =
   proc(options: BackendOptions): Future[PubSub] {.gcsafe.}
 
-proc settleContract() {.async.} =
+proc settleContract(): Future[void] {.gcsafe.}
+
+proc probePubSubContract*(factory: PubSubFactory): Future[seq[string]] {.async.} =
+  let bus = await factory(defaultBackendOptions())
+  var deliveries = 0
+  let handler: MessageHandler =
+    proc(channel, payload: string): Future[void] {.async.} =
+      inc deliveries
+  if (await bus.publish("probe", "none")) != 0:
+    result.add("empty publish count")
+  let first = await bus.subscribe("probe", handler)
+  discard await bus.subscribe("probe", handler)
+  if (await bus.publish("probe", "message")) != 2:
+    result.add("local publish count")
+  await settleContract()
+  if deliveries != 2:
+    result.add("delivery")
+  await bus.unsubscribe(first)
+  if (await bus.publish("probe", "again")) != 1:
+    result.add("unsubscribe")
+  await bus.close()
+  try:
+    discard await bus.publish("probe", "closed")
+    result.add("closed lifecycle")
+  except BackendClosedError:
+    discard
+
+proc settleContract() {.async, gcsafe.} =
   await sleepAsync(10.milliseconds)
 
 template pubSubContractSuite*(backendName: string, factory: PubSubFactory) =
@@ -27,6 +54,24 @@ template pubSubContractSuite*(backendName: string, factory: PubSubFactory) =
         await bus.unsubscribe(subscription)
         await bus.unsubscribe(subscription)
         check (await bus.publish("events", "3")) == 0
+        await bus.close()
+      waitFor exercise()
+
+    test "publish reports active local subscriptions":
+      proc exercise() {.async.} =
+        let bus = await factory(defaultBackendOptions())
+        let handler: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            discard
+        check (await bus.publish("counts", "zero")) == 0
+        let first = await bus.subscribe("counts", handler)
+        check (await bus.publish("counts", "one")) == 1
+        let second = await bus.subscribe("counts", handler)
+        check (await bus.publish("counts", "two")) == 2
+        await bus.unsubscribe(first)
+        check (await bus.publish("counts", "one-again")) == 1
+        await bus.unsubscribe(second)
+        check (await bus.publish("counts", "zero-again")) == 0
         await bus.close()
       waitFor exercise()
 

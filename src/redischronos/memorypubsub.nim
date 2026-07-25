@@ -1,4 +1,4 @@
-import std/[tables]
+import std/[deques, sequtils, tables]
 import chronos
 
 import ./api
@@ -11,7 +11,7 @@ type
     channel: string
     handler: MessageHandler
     active: bool
-    queue: seq[string]
+    queue: Deque[string]
     worker: Future[void]
     owner: InProcessPubSub
 
@@ -22,9 +22,15 @@ type
     isClosed: bool
     options: BackendOptions
     currentStateHandler: StateHandler
-    stateTask: Future[void]
+    stateQueue: Deque[ConnectionState]
+    stateWorker: Future[void]
 
 proc newInProcessPubSub*(options: BackendOptions): PubSub =
+  if options.pubSubMaxPendingMessages <= 0:
+    raise newException(
+      InvalidArgumentError,
+      "pubSubMaxPendingMessages must be positive"
+    )
   InProcessPubSub(
     channels: initTable[string, seq[MemorySubscription]](),
     options: options
@@ -39,9 +45,10 @@ proc requireChannel(channel: string) =
     raise newException(InvalidArgumentError, "channel must not be empty")
 
 proc deliver(subscription: MemorySubscription) {.async.} =
-  while subscription.queue.len > 0:
-    let payload = subscription.queue[0]
-    subscription.queue.delete(0)
+  while subscription.active and subscription.queue.len > 0:
+    let payload = subscription.queue.popFirst()
+    if not subscription.active:
+      break
     try:
       await subscription.handler(subscription.channel, payload)
     except CancelledError:
@@ -58,15 +65,21 @@ proc startWorker(subscription: MemorySubscription) =
   if subscription.worker == nil or subscription.worker.finished:
     subscription.worker = deliver(subscription)
 
-proc notifyState(bus: InProcessPubSub,
-    state: ConnectionState): Future[void] {.async.} =
-  if bus.currentStateHandler != nil:
-    try:
-      await bus.currentStateHandler(state)
-    except CancelledError:
-      raise
-    except CatchableError:
-      discard
+proc observeStates(bus: InProcessPubSub) {.async.} =
+  while bus.stateQueue.len > 0:
+    let state = bus.stateQueue.popFirst()
+    if bus.currentStateHandler != nil:
+      try:
+        await bus.currentStateHandler(state)
+      except CancelledError:
+        raise
+      except CatchableError:
+        discard
+
+proc notifyState(bus: InProcessPubSub, state: ConnectionState) =
+  bus.stateQueue.addLast(state)
+  if bus.stateWorker == nil or bus.stateWorker.finished:
+    bus.stateWorker = bus.observeStates()
 
 method subscribe*(bus: InProcessPubSub, channel: string,
     handler: MessageHandler): Future[Subscription] {.async.} =
@@ -93,8 +106,15 @@ method unsubscribe*(bus: InProcessPubSub,
     return
   if subscription of MemorySubscription:
     let memorySubscription = MemorySubscription(subscription)
-    if memorySubscription.owner == bus:
+    if memorySubscription.owner == bus and memorySubscription.active:
       memorySubscription.active = false
+      memorySubscription.queue.clear()
+      let channel = memorySubscription.channel
+      bus.subscriptions.keepItIf(it != memorySubscription)
+      if bus.channels.hasKey(channel):
+        bus.channels[channel].keepItIf(it != memorySubscription)
+        if bus.channels[channel].len == 0:
+          bus.channels.del(channel)
 
 method publish*(bus: InProcessPubSub, channel,
     payload: string): Future[int64] {.async.} =
@@ -105,14 +125,15 @@ method publish*(bus: InProcessPubSub, channel,
   let snapshot = bus.channels[channel]
   for subscription in snapshot:
     if subscription.active:
-      subscription.queue.add(payload)
+      if subscription.queue.len < bus.options.pubSubMaxPendingMessages:
+        subscription.queue.addLast(payload)
       subscription.startWorker()
       inc result
 
 method onStateChange*(bus: InProcessPubSub, handler: StateHandler) {.gcsafe.} =
   bus.currentStateHandler = handler
   let state = if bus.isClosed: csClosed else: csConnected
-  bus.stateTask = bus.notifyState(state)
+  bus.notifyState(state)
 
 method close*(bus: InProcessPubSub): Future[void] {.async.} =
   if bus.isClosed:
@@ -123,9 +144,12 @@ method close*(bus: InProcessPubSub): Future[void] {.async.} =
   for subscription in bus.subscriptions:
     if subscription.worker != nil and not subscription.worker.finished:
       await subscription.worker.cancelAndWait()
-  if bus.stateTask != nil and not bus.stateTask.finished:
-    await bus.stateTask
   if bus.currentStateHandler != nil:
-    await bus.notifyState(csClosed)
+    bus.notifyState(csClosed)
+  if bus.stateWorker != nil and not bus.stateWorker.finished:
+    try:
+      await bus.stateWorker.wait(bus.options.operationTimeout)
+    except AsyncTimeoutError:
+      await bus.stateWorker.cancelAndWait()
   bus.channels.clear()
   bus.subscriptions.setLen(0)

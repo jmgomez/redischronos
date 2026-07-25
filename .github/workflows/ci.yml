@@ -22,9 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         mm: [refc, orc]
-    env:
-      REDIS_TEST_URL: redis://127.0.0.1:6379/15
-
     steps:
       - uses: actions/checkout@v4
 
@@ -36,11 +33,22 @@ jobs:
       - name: Install dependencies
         run: nimble install -y --depsOnly
 
-      - name: Run memory and mandatory Redis contracts
+      - name: Configure password and ACL authentication
+        run: |
+          docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass audit-password
+          docker exec "${{ job.services.redis.id }}" redis-cli -a audit-password ACL SETUSER audituser on '>acl-password' '~*' '+@all'
+
+      - name: Run password-authenticated memory and Redis contracts
+        env:
+          REDIS_TEST_CONTAINER: ${{ job.services.redis.id }}
+          REDIS_TEST_URL: redis://:audit-password@127.0.0.1:6379/15
         run: nim c --mm:${{ matrix.mm }} --path:src -d:test -d:redisIntegration -r tests/tall.nim
 
-      - name: Prove Redis survives a bounded service restart
-        run: |
-          docker restart "${{ job.services.redis.id }}"
-          timeout 30s sh -c 'until docker exec "${{ job.services.redis.id }}" redis-cli ping | grep -q PONG; do sleep 1; done'
-          nim c --mm:${{ matrix.mm }} --path:src -d:test -d:redisIntegration -r tests/tall.nim
+      - name: Run ACL-authenticated memory and Redis contracts
+        env:
+          REDIS_TEST_CONTAINER: ${{ job.services.redis.id }}
+          REDIS_TEST_URL: redis://audituser:acl-password@127.0.0.1:6379/15
+        run: nim c --mm:${{ matrix.mm }} --path:src -d:test -d:redisIntegration -r tests/tall.nim
+
+      - name: Verify Redis was restored by the outage contract
+        run: timeout 30s sh -c 'until docker exec "${{ job.services.redis.id }}" redis-cli ping | grep -q PONG; do sleep 1; done'
