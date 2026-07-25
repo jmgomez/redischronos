@@ -1,3 +1,4 @@
+import std/strutils
 import chronos
 
 import ./api
@@ -5,21 +6,27 @@ import ./errors
 import ./memorykv
 import ./memorypubsub
 import ./options
+import ./rediskv
+import ./redispubsub
 
-proc normalizeMemoryUrl(url: string) =
+proc openKvStore*(url = "mem://",
+    options = defaultBackendOptions()): Future[KvStore] {.async.} =
   if url.len == 0 or url == "mem://":
-    return
+    return newInMemoryKvStore(maxEntries = options.memoryMaxEntries)
+  if url.startsWith("redis://"):
+    return newRedisKvStore(url, options)
   raise newException(
     InvalidBackendUrlError,
     "unsupported backend URL scheme"
   )
 
-proc openKvStore*(url = "mem://",
-    options = defaultBackendOptions()): Future[KvStore] {.async.} =
-  normalizeMemoryUrl(url)
-  return newInMemoryKvStore(maxEntries = options.memoryMaxEntries)
-
 proc openPubSub*(url = "mem://",
     options = defaultBackendOptions()): Future[PubSub] {.async.} =
-  normalizeMemoryUrl(url)
-  return newInProcessPubSub(options)
+  if url.len == 0 or url == "mem://":
+    return newInProcessPubSub(options)
+  if url.startsWith("redis://"):
+    return await newRedisPubSub(url, options)
+  raise newException(
+    InvalidBackendUrlError,
+    "unsupported backend URL scheme"
+  )

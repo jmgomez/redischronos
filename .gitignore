@@ -6,4 +6,12 @@
 nimcache/
 tests/tall
 tests/tall.exe
-
+tests/tcontractharness
+tests/tmemorykv
+tests/tmemorypubsub
+tests/tredisconnection
+tests/trediskv
+tests/tredispubsub
+tests/tredisurl
+tests/tresp2
+examples/backendswitch

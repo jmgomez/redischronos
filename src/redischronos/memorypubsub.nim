@@ -46,12 +46,12 @@ proc deliver(subscription: MemorySubscription) {.async.} =
       await subscription.handler(subscription.channel, payload)
     except CancelledError:
       raise
-    except CatchableError as cause:
+    except CatchableError:
       if subscription.owner.options.onHandlerError != nil:
         subscription.owner.options.onHandlerError(HandlerError(
           channel: subscription.channel,
           subscriptionId: subscription.id,
-          cause: cause
+          cause: newException(ValueError, "message handler failed")
         ))
 
 proc startWorker(subscription: MemorySubscription) =

@@ -33,14 +33,16 @@ template pubSubContractSuite*(backendName: string, factory: PubSubFactory) =
     test "handler failures are isolated":
       proc exercise() {.async.} =
         var errors = 0
+        var observedCause = ""
         var options = defaultBackendOptions()
         options.onHandlerError =
           proc(error: HandlerError) {.gcsafe, raises: [].} =
             inc errors
+            observedCause = error.cause.msg
         let bus = await factory(options)
         let failing: MessageHandler =
           proc(channel, payload: string): Future[void] {.async.} =
-            raise newException(ValueError, "failed")
+            raise newException(ValueError, payload)
         var healthy = 0
         let handler: MessageHandler =
           proc(channel, payload: string): Future[void] {.async.} =
@@ -51,6 +53,7 @@ template pubSubContractSuite*(backendName: string, factory: PubSubFactory) =
         await settleContract()
         check errors == 1
         check healthy == 1
+        check observedCause != "secret"
         await bus.close()
       waitFor exercise()
 

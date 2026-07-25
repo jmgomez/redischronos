@@ -1,7 +1,7 @@
 import std/[os, strutils]
 
 # Package
-version       = "0.1.0"
+version       = "1.0.0"
 author        = "jmgomez"
 description   = "Chronos-native KV and Pub/Sub with interchangeable memory and Redis backends"
 license       = "MIT"
@@ -29,8 +29,16 @@ proc resolveNim(): string =
 
   quit "Nim 2.2.x not found; set NIM_BIN to the absolute Nim binary path"
 
-proc testCommand(mm = ""; testFile = "tests/tall.nim"): string =
+proc testCommand(
+    mm = "";
+    testFile = "tests/tall.nim";
+    redisIntegration = false
+): string =
   result = quoteShell(resolveNim()) & " c --path:src -d:test"
+  if redisIntegration:
+    if getEnv("REDIS_TEST_URL").strip().len == 0:
+      quit "REDIS_TEST_URL is mandatory for Redis integration tests"
+    result.add " -d:redisIntegration"
   if mm.len > 0:
     result.add " --mm:" & mm
   result.add " -r " & quoteShell(testFile)
@@ -43,6 +51,12 @@ task testRefc, "Run all tests with refc":
 
 task testOrc, "Run all tests with ORC":
   exec testCommand("orc")
+
+task testRedisRefc, "Run memory and mandatory real-Redis tests with refc":
+  exec testCommand("refc", redisIntegration = true)
+
+task testRedisOrc, "Run memory and mandatory real-Redis tests with ORC":
+  exec testCommand("orc", redisIntegration = true)
 
 task testFile, "Run one test file; pass its path as the first argument":
   if commandLineParams().len == 0:

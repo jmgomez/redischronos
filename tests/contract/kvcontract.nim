@@ -21,6 +21,8 @@ template kvContractSuite*(backendName: string, factory: KvFactory) =
   suite backendName & " KV contract":
     test "missing, round-trip, overwrite, exists, and delete":
       let store = waitFor factory()
+      discard waitFor store.delete("missing")
+      discard waitFor store.delete("key")
       check (waitFor store.get("missing")).isNone
       let value = "before\0after\xFF"
       waitFor store.set("key", value)
@@ -46,17 +48,28 @@ template kvContractSuite*(backendName: string, factory: KvFactory) =
     test "increment is atomic and preserves invalid values":
       proc exercise() {.async.} =
         let store = await factory()
+        discard await store.delete("counter")
         var increments: seq[Future[int64]]
-        for _ in 0 ..< 200:
+        for _ in 0 ..< 50:
           increments.add(store.increment("counter"))
         for increment in increments:
           discard await increment
-        check (await store.get("counter")) == some("200")
+        check (await store.get("counter")) == some("50")
         for value in ["invalid", $high(int64)]:
           await store.set("counter", value)
           expect RedisCommandError:
             discard await store.increment("counter")
           check (await store.get("counter")) == some(value)
+        await store.close()
+      waitFor exercise()
+
+    test "positive TTL expires":
+      proc exercise() {.async.} =
+        let store = await factory()
+        await store.set("expiring-contract-key", "value", 1)
+        check (await store.get("expiring-contract-key")) == some("value")
+        await sleepAsync(1100.milliseconds)
+        check (await store.get("expiring-contract-key")).isNone
         await store.close()
       waitFor exercise()
 

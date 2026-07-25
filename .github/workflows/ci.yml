@@ -6,12 +6,24 @@ on:
   pull_request:
 
 jobs:
-  memory:
+  test:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
     strategy:
       fail-fast: false
       matrix:
         mm: [refc, orc]
+    env:
+      REDIS_TEST_URL: redis://127.0.0.1:6379/15
 
     steps:
       - uses: actions/checkout@v4
@@ -24,5 +36,11 @@ jobs:
       - name: Install dependencies
         run: nimble install -y --depsOnly
 
-      - name: Run tests
-        run: nim c --mm:${{ matrix.mm }} --path:src -d:test -r tests/tall.nim
+      - name: Run memory and mandatory Redis contracts
+        run: nim c --mm:${{ matrix.mm }} --path:src -d:test -d:redisIntegration -r tests/tall.nim
+
+      - name: Prove Redis survives a bounded service restart
+        run: |
+          docker restart "${{ job.services.redis.id }}"
+          timeout 30s sh -c 'until docker exec "${{ job.services.redis.id }}" redis-cli ping | grep -q PONG; do sleep 1; done'
+          nim c --mm:${{ matrix.mm }} --path:src -d:test -d:redisIntegration -r tests/tall.nim
