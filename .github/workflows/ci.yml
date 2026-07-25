@@ -16,14 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.x"
+      - name: Verify preinstalled toolchain
+        run: |
+          nim --version
+          nimble --version
 
       - name: Install dependencies
         run: nimble install -y --depsOnly
 
       - name: Run tests
         run: nim c --mm:${{ matrix.mm }} --path:src -d:test -r tests/tall.nim
-
