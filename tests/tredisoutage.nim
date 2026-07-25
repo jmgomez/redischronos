@@ -17,7 +17,8 @@ when defined(redisIntegration):
             check execCmd(
               base & " -a audit-password ACL SETUSER audituser on " &
               quoteShell(">acl-password") & " " &
-              quoteShell("~*") & " " & quoteShell("+@all")
+              quoteShell("~*") & " " & quoteShell("&*") & " " &
+              quoteShell("+@all")
             ) == 0
           let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
           var states: seq[ConnectionState]

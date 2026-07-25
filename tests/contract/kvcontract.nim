@@ -11,15 +11,15 @@ proc probeKvContract*(factory: KvFactory): Future[seq[string]] {.async.} =
   await store.set("roundtrip", "before\0after\xFF")
   if (await store.get("roundtrip")) != some("before\0after\xFF"):
     result.add("round trip")
-  if not (await store.delete("roundtrip")):
-    result.add("delete")
-  if (await store.increment("counter")) != 1:
-    result.add("increment")
   try:
     if not (await store.exists("roundtrip")):
       result.add("exists")
   except CatchableError:
     result.add("exists")
+  if not (await store.delete("roundtrip")):
+    result.add("delete")
+  if (await store.increment("counter")) != 1:
+    result.add("increment")
   await store.set("roundtrip", "overwritten")
   if (await store.get("roundtrip")) != some("overwritten"):
     result.add("overwrite")
@@ -37,6 +37,8 @@ proc probeKvContract*(factory: KvFactory): Future[seq[string]] {.async.} =
     discard
   except CatchableError:
     result.add("negative ttl")
+  discard await store.delete("roundtrip")
+  discard await store.delete("counter")
   await store.close()
   try:
     discard await store.get("closed")

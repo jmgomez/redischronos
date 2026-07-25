@@ -69,6 +69,82 @@ proc subscribeAck(channel: string): string =
   ]))
 
 suite "Redis Pub/Sub fault injection":
+  test "post-write subscribe cancellation closes ambiguous transport":
+    proc exercise() {.async.} =
+      let server = startFaultServer()
+      let commandSeen = newFuture[void]("subscribe write observed")
+      var eofSeen = false
+      let serving = proc() {.async.} =
+        let client = await server.clients.popFirst()
+        let parser = newRespParser()
+        check commandName(await readFrame(client, parser)) == "PING"
+        discard await client.write("+PONG\r\n")
+        check commandName(await readFrame(client, parser)) == "SUBSCRIBE"
+        commandSeen.complete()
+        var byte: byte
+        eofSeen = (await client.readOnce(addr byte, 1)) == 0
+        await client.closeWait()
+      let serverTask = serving()
+      let bus = await openPubSub(server.redisUrl())
+      let subscribing = bus.subscribe(
+        "cancel-after-write",
+        proc(channel, payload: string): Future[void] {.async.} =
+          discard
+      )
+      await commandSeen
+      subscribing.cancelSoon()
+      expect CancelledError:
+        discard await subscribing
+      for _ in 0 ..< 50:
+        if eofSeen:
+          break
+        await sleepAsync(2.milliseconds)
+      check eofSeen
+      await bus.close()
+      await serverTask
+      await server.closeServer()
+    waitFor exercise()
+
+  test "post-write unsubscribe cancellation closes ambiguous transport":
+    proc exercise() {.async.} =
+      let server = startFaultServer()
+      let commandSeen = newFuture[void]("unsubscribe write observed")
+      var eofSeen = false
+      let serving = proc() {.async.} =
+        let client = await server.clients.popFirst()
+        let parser = newRespParser()
+        check commandName(await readFrame(client, parser)) == "PING"
+        discard await client.write("+PONG\r\n")
+        let subscribing = await readFrame(client, parser)
+        let channel = commandArgument(subscribing, 1)
+        discard await client.write(subscribeAck(channel))
+        check commandName(await readFrame(client, parser)) == "UNSUBSCRIBE"
+        commandSeen.complete()
+        var byte: byte
+        eofSeen = (await client.readOnce(addr byte, 1)) == 0
+        await client.closeWait()
+      let serverTask = serving()
+      let bus = await openPubSub(server.redisUrl())
+      let subscription = await bus.subscribe(
+        "cancel-unsubscribe-after-write",
+        proc(channel, payload: string): Future[void] {.async.} =
+          discard
+      )
+      let unsubscribing = bus.unsubscribe(subscription)
+      await commandSeen
+      unsubscribing.cancelSoon()
+      expect CancelledError:
+        await unsubscribing
+      for _ in 0 ..< 50:
+        if eofSeen:
+          break
+        await sleepAsync(2.milliseconds)
+      check eofSeen
+      await bus.close()
+      await serverTask
+      await server.closeServer()
+    waitFor exercise()
+
   test "subscribe timeout rolls back and retry owns one live handle":
     proc exercise() {.async.} =
       let server = startFaultServer()

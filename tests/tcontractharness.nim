@@ -52,7 +52,7 @@ suite "contract harness self-test":
   test "a deliberately broken backend fails every probe":
     check (waitFor probeKvContract(openBrokenKv)) ==
       @[
-        "missing get", "round trip", "delete", "increment", "exists",
+        "missing get", "round trip", "exists", "delete", "increment",
         "overwrite", "invalid key", "negative ttl", "closed lifecycle"
       ]
 

@@ -1,4 +1,4 @@
-import std/[options, tables]
+import std/[options, sequtils, tables]
 import chronos
 
 import ./api
@@ -20,6 +20,9 @@ type
   InFlight = ref object
     task: Future[string]
     waiters: int
+    cacheGeneration: uint64
+    keyGeneration: uint64
+    invokingLoader: bool
 
   Cache* = ref object
     store: KvStore
@@ -27,6 +30,10 @@ type
     fills: Table[string, InFlight]
     closed: bool
     closeTask: Future[void]
+    generation: uint64
+    keyGenerations: Table[string, uint64]
+    owned: seq[FutureBase]
+    activeOperations: int
 
 func defaultCacheOptions*(): CacheOptions =
   CacheOptions(
@@ -44,7 +51,8 @@ proc newCache*(store: KvStore,
   Cache(
     store: store,
     options: options,
-    fills: initTable[string, InFlight]()
+    fills: initTable[string, InFlight](),
+    keyGenerations: initTable[string, uint64]()
   )
 
 proc requireOpen(cache: Cache) =
@@ -58,39 +66,84 @@ proc versionedKey*(key: string, version: int64): string =
     raise newException(InvalidArgumentError, "cache version must not be negative")
   key & ":v" & $version
 
-proc bumpVersion*(cache: Cache, key: string): Future[int64] {.async.} =
+proc bumpVersionImpl(cache: Cache, key: string): Future[int64] {.async.} =
   cache.requireOpen()
   if key.len == 0:
     raise newException(InvalidArgumentError, "cache key must not be empty")
-  return await cache.store.increment(key)
+  inc cache.keyGenerations.mgetOrPut(key, 0'u64)
+  if cache.fills.hasKey(key):
+    let entry = cache.fills[key]
+    cache.fills.del(key)
+    if not entry.task.finished:
+      entry.task.cancelSoon()
+      await allFutures(entry.task)
+  cache.requireOpen()
+  let incrementing = cache.store.increment(key)
+  cache.owned.add(incrementing)
+  try:
+    return await incrementing
+  except CancelledError:
+    raise
+  except CatchableError:
+    if cache.options.failurePolicy == cfpFailOpen:
+      return 0
+    raise
+  finally:
+    cache.owned.keepItIf(it != incrementing)
 
 proc read(cache: Cache, key: string): Future[Option[string]] {.async.} =
+  let reading = cache.store.get(key)
+  cache.owned.add(reading)
   try:
-    return await cache.store.get(key)
+    return await reading
   except CancelledError:
     raise
   except CatchableError:
     if cache.options.failurePolicy == cfpFailOpen:
       return none(string)
     raise
+  finally:
+    cache.owned.keepItIf(it != reading)
 
 proc fill(cache: Cache, key: string, loader: CacheLoader,
     entry: InFlight): Future[string] {.async.} =
   try:
-    let value = await loader(key)
+    # Yield once so the entry's task is published before loader code can
+    # re-enter getOrLoad for the same key.
+    await sleepAsync(0.milliseconds)
+    entry.invokingLoader = true
+    let loading = loader(key)
+    entry.invokingLoader = false
+    cache.owned.add(loading)
+    let value =
+      try:
+        await loading
+      finally:
+        cache.owned.keepItIf(it != loading)
+    if cache.closed or cache.generation != entry.cacheGeneration or
+        cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
+      raise newException(BackendClosedError, "cache fill was fenced")
+    let writing =
+      cache.store.set(key, value, cache.options.ttlSeconds)
+    cache.owned.add(writing)
     try:
-      await cache.store.set(key, value, cache.options.ttlSeconds)
+      await writing
     except CancelledError:
       raise
     except CatchableError:
       if cache.options.failurePolicy == cfpPropagate:
         raise
+    finally:
+      cache.owned.keepItIf(it != writing)
+    if cache.closed or cache.generation != entry.cacheGeneration or
+        cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
+      raise newException(BackendClosedError, "cache fill was fenced")
     return value
   finally:
     if cache.fills.hasKey(key) and cache.fills[key] == entry:
       cache.fills.del(key)
 
-proc getOrLoad*(cache: Cache, key: string,
+proc getOrLoadImpl(cache: Cache, key: string,
     loader: CacheLoader): Future[string] {.async.} =
   cache.requireOpen()
   if key.len == 0:
@@ -98,8 +151,32 @@ proc getOrLoad*(cache: Cache, key: string,
   if loader == nil:
     raise newException(InvalidArgumentError, "cache loader must not be nil")
 
+  if cache.fills.hasKey(key):
+    let existing = cache.fills[key]
+    if existing.invokingLoader:
+      raise newException(
+        InvalidArgumentError,
+        "cache loader must not recursively load its own key"
+      )
+    if existing.task != nil and not existing.task.finished:
+      inc existing.waiters
+      try:
+        await allFutures(existing.task)
+        if cache.closed:
+          raise newException(BackendClosedError, "cache is closed")
+        return existing.task.read()
+      finally:
+        dec existing.waiters
+        if existing.waiters == 0 and not existing.task.finished and
+            cache.options.cancellationPolicy == ccpCancelOrphaned:
+          inc cache.keyGenerations.mgetOrPut(key, 0'u64)
+          if cache.fills.getOrDefault(key) == existing:
+            cache.fills.del(key)
+          existing.task.cancelSoon()
+
   let cached = await cache.read(key)
   if cached.isSome:
+    cache.requireOpen()
     return cached.get()
   cache.requireOpen()
 
@@ -107,46 +184,71 @@ proc getOrLoad*(cache: Cache, key: string,
   if cache.fills.hasKey(key):
     entry = cache.fills[key]
   else:
-    entry = InFlight()
+    let keyGeneration = cache.keyGenerations.getOrDefault(key)
+    entry = InFlight(
+      cacheGeneration: cache.generation,
+      keyGeneration: keyGeneration
+    )
     cache.fills[key] = entry
     entry.task = cache.fill(key, loader, entry)
   inc entry.waiters
   try:
     await allFutures(entry.task)
+    if cache.closed:
+      raise newException(BackendClosedError, "cache is closed")
     return entry.task.read()
   finally:
     dec entry.waiters
     if entry.waiters == 0 and not entry.task.finished and
         cache.options.cancellationPolicy == ccpCancelOrphaned:
+      inc cache.keyGenerations.mgetOrPut(key, 0'u64)
+      if cache.fills.getOrDefault(key) == entry:
+        cache.fills.del(key)
       entry.task.cancelSoon()
 
-proc invalidate*(cache: Cache, key: string): Future[bool] {.async.} =
+proc invalidateImpl(cache: Cache, key: string): Future[bool] {.async.} =
   cache.requireOpen()
   if key.len == 0:
     raise newException(InvalidArgumentError, "cache key must not be empty")
+  inc cache.keyGenerations.mgetOrPut(key, 0'u64)
+  if cache.fills.hasKey(key):
+    let entry = cache.fills[key]
+    cache.fills.del(key)
+    if not entry.task.finished:
+      entry.task.cancelSoon()
+      await allFutures(entry.task)
+  cache.requireOpen()
+  let deleting = cache.store.delete(key)
+  cache.owned.add(deleting)
   try:
-    return await cache.store.delete(key)
+    return await deleting
   except CancelledError:
     raise
   except CatchableError:
     if cache.options.failurePolicy == cfpFailOpen:
       return false
     raise
+  finally:
+    cache.owned.keepItIf(it != deleting)
 
 proc closeOwned(cache: Cache): Future[void] {.async.} =
-  var tasks: seq[Future[string]]
+  inc cache.generation
+  var tasks: seq[FutureBase]
   for _, entry in cache.fills.pairs:
     if entry.task != nil and not entry.task.finished:
       entry.task.cancelSoon()
       tasks.add(entry.task)
-  for task in tasks:
-    try:
-      discard await task
-    except CancelledError:
-      discard
-    except CatchableError:
-      discard
+  for operation in cache.owned:
+    if not operation.finished:
+      operation.cancelSoon()
+      tasks.add(operation)
+  if tasks.len > 0:
+    await allFutures(tasks)
+  while cache.activeOperations > 0:
+    await sleepAsync(0.milliseconds)
   cache.fills.clear()
+  cache.owned.setLen(0)
+  cache.keyGenerations.clear()
 
 proc joinClose(cache: Cache): Future[void] {.async.} =
   if cache.closeTask == nil:
@@ -156,3 +258,28 @@ proc joinClose(cache: Cache): Future[void] {.async.} =
 
 proc close*(cache: Cache): Future[void] =
   cache.joinClose()
+
+proc getOrLoad*(cache: Cache, key: string,
+    loader: CacheLoader): Future[string] {.async.} =
+  cache.requireOpen()
+  inc cache.activeOperations
+  try:
+    return await cache.getOrLoadImpl(key, loader)
+  finally:
+    dec cache.activeOperations
+
+proc invalidate*(cache: Cache, key: string): Future[bool] {.async.} =
+  cache.requireOpen()
+  inc cache.activeOperations
+  try:
+    return await cache.invalidateImpl(key)
+  finally:
+    dec cache.activeOperations
+
+proc bumpVersion*(cache: Cache, key: string): Future[int64] {.async.} =
+  cache.requireOpen()
+  inc cache.activeOperations
+  try:
+    return await cache.bumpVersionImpl(key)
+  finally:
+    dec cache.activeOperations

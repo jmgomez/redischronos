@@ -131,10 +131,11 @@ during downtime are ephemeral and are not recovered. Applications choose
 their own fail-open or fail-closed policy.
 
 DNS resolution runs off the Chronos event loop. Address candidates share one
-connect deadline; command lock admission and each command reply use one
-operation deadline. Subscriber lock, write, and acknowledgement stages share
-one absolute operation deadline. Zero or exhausted budgets start no lock or
-network operation.
+connect deadline. A command's lock admission, establishment/handshake, write,
+and reply share one absolute `operationTimeout`; `connectTimeout` additionally
+caps its TCP-connect stage. Subscriber lock, write, and acknowledgement stages
+share one absolute operation deadline. Zero or exhausted budgets start no lock
+or network operation.
 
 Close is join-idempotent and cancellation-shielded: concurrent callers wait
 for one owned cleanup task, so cancelling a caller cannot strand transports,
@@ -189,7 +190,11 @@ waitFor main()
 
 Concurrent misses for one key share a loader. `CacheOptions` controls TTL,
 backend fail-open behavior, and whether a loader with no remaining waiters is
-cancelled. The injected `KvStore` remains caller-owned.
+cancelled. Invalidation, version bumps, and close fence older fills before
+they can write. In fail-open mode, read/write failures fall back to the loader,
+failed invalidation returns `false`, and a failed version increment returns
+`0`; cancellation is always propagated. The injected `KvStore` remains
+caller-owned.
 
 Both runs produce the same contract-observable output. Only the URL changes.
 

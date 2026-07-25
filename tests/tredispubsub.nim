@@ -188,7 +188,8 @@ when defined(redisIntegration):
         discard await bus.subscribe(
           "redischronos:callback-close",
           proc(channel, payload: string): Future[void] {.async.} =
-            discard bus.close()
+            await sleepAsync(1.milliseconds)
+            await bus.close()
             returned.complete()
         )
         discard await bus.publish(
@@ -200,6 +201,21 @@ when defined(redisIntegration):
           discard await bus.publish(
             "redischronos:callback-close", "after close"
           )
+      waitFor exercise()
+
+    test "a yielding state observer can await close":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let returned = newFuture[void]("Redis state callback close returned")
+        bus.onStateChange(
+          proc(state: ConnectionState): Future[void] {.async.} =
+            if state == csConnected and not returned.finished:
+              await sleepAsync(1.milliseconds)
+              await bus.close()
+              returned.complete()
+        )
+        await returned.wait(200.milliseconds)
+        await bus.close()
       waitFor exercise()
 
     test "bounded queues and retiring workers remain owned through close":
@@ -234,6 +250,26 @@ when defined(redisIntegration):
         await second
         check calls == 1
         check terminated
+      waitFor exercise()
+
+    test "completed retiring workers compact without waiting for close":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let started = newFuture[void]("Redis compact worker started")
+        let release = newFuture[void]("Redis compact worker release")
+        let subscription = await bus.subscribe(
+          "redischronos:compact",
+          proc(channel, payload: string): Future[void] {.async.} =
+            started.complete()
+            await release
+        )
+        discard await bus.publish("redischronos:compact", "payload")
+        await started
+        await bus.unsubscribe(subscription)
+        release.complete()
+        await sleepAsync(20.milliseconds)
+        check bus.deliveryStateCountsForTest() == (0, 0, 0)
+        await bus.close()
       waitFor exercise()
 
     test "observer replacement and post-close registration own no stray task":

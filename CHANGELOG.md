@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1 — 2026-07-25
+
+- Fence cache fills against invalidation, version changes, orphan replacement,
+  and close while owning blocked reads and waiters.
+- Make message and state callbacks safe to await Pub/Sub close.
+- Close ambiguous subscriber writes on cancellation and compact retired
+  delivery state during normal operation.
+- Enforce one end-to-end command/connection deadline, return DNS results
+  without a second event-loop lookup, and fix Redis ACL channel permissions.
+- Strengthen cache failure-policy, mutation-oracle, and release evidence.
+
 ## 1.1.0 — 2026-07-25
 
 - Make Redis command close/admission races terminal and preserve active

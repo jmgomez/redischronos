@@ -41,7 +41,7 @@ jobs:
       - name: Configure password and ACL authentication
         run: |
           docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass audit-password
-          docker exec "${{ job.services.redis.id }}" redis-cli -a audit-password ACL SETUSER audituser on '>acl-password' '~*' '+@all'
+          docker exec "${{ job.services.redis.id }}" redis-cli -a audit-password ACL SETUSER audituser on '>acl-password' '~*' '&*' '+@all'
 
       - name: Run password-authenticated memory and Redis contracts
         env:

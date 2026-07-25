@@ -13,6 +13,7 @@ type
     active: bool
     queue: Deque[string]
     worker: Future[void]
+    handlerTask: Future[void]
     owner: InProcessPubSub
 
   InProcessPubSub* = ref object of PubSub
@@ -25,7 +26,9 @@ type
     currentStateHandler: StateHandler
     stateQueue: Deque[ConnectionState]
     stateWorker: Future[void]
+    stateHandlerTask: Future[void]
     closeTask: Future[void]
+    closeCallers: seq[Future[void]]
 
 proc newInProcessPubSub*(options: BackendOptions): PubSub =
   if options.pubSubMaxPendingMessages <= 0:
@@ -47,21 +50,31 @@ proc requireChannel(channel: string) =
     raise newException(InvalidArgumentError, "channel must not be empty")
 
 proc deliver(subscription: MemorySubscription) {.async.} =
-  while subscription.active and subscription.queue.len > 0:
-    let payload = subscription.queue.popFirst()
+  try:
+    while subscription.active and subscription.queue.len > 0:
+      let payload = subscription.queue.popFirst()
+      if not subscription.active:
+        break
+      try:
+        subscription.handlerTask =
+          subscription.handler(subscription.channel, payload)
+        await subscription.handlerTask
+      except CancelledError:
+        raise
+      except CatchableError:
+        if subscription.owner.options.onHandlerError != nil:
+          subscription.owner.options.onHandlerError(HandlerError(
+            channel: subscription.channel,
+            subscriptionId: subscription.id,
+            cause: newException(ValueError, "message handler failed")
+          ))
+      finally:
+        subscription.handlerTask = nil
+  finally:
     if not subscription.active:
-      break
-    try:
-      await subscription.handler(subscription.channel, payload)
-    except CancelledError:
-      raise
-    except CatchableError:
-      if subscription.owner.options.onHandlerError != nil:
-        subscription.owner.options.onHandlerError(HandlerError(
-          channel: subscription.channel,
-          subscriptionId: subscription.id,
-          cause: newException(ValueError, "message handler failed")
-        ))
+      subscription.queue.clear()
+      subscription.handler = nil
+      subscription.owner.retiring.keepItIf(it != subscription)
 
 proc startWorker(subscription: MemorySubscription) =
   if subscription.worker == nil or subscription.worker.finished:
@@ -72,11 +85,14 @@ proc observeStates(bus: InProcessPubSub) {.async.} =
     let state = bus.stateQueue.popFirst()
     if bus.currentStateHandler != nil:
       try:
-        await bus.currentStateHandler(state)
+        bus.stateHandlerTask = bus.currentStateHandler(state)
+        await bus.stateHandlerTask
       except CancelledError:
         raise
       except CatchableError:
         discard
+      finally:
+        bus.stateHandlerTask = nil
 
 proc notifyState(bus: InProcessPubSub, state: ConnectionState) =
   bus.stateQueue.addLast(state)
@@ -144,6 +160,7 @@ method onStateChange*(bus: InProcessPubSub, handler: StateHandler) {.gcsafe.} =
   bus.notifyState(csConnected)
 
 proc closeOwned(bus: InProcessPubSub) {.async.} =
+  await sleepAsync(0.milliseconds)
   for subscription in bus.subscriptions:
     subscription.active = false
   for subscription in bus.retiring:
@@ -151,14 +168,26 @@ proc closeOwned(bus: InProcessPubSub) {.async.} =
   let owned = bus.subscriptions & bus.retiring
   for subscription in owned:
     if subscription.worker != nil and not subscription.worker.finished:
-      await subscription.worker.cancelAndWait()
+      var callbackClosing = false
+      if subscription.handlerTask != nil:
+        for caller in bus.closeCallers:
+          if subscription.handlerTask.internalChild == caller:
+            callbackClosing = true
+      if not callbackClosing:
+        await subscription.worker.cancelAndWait()
   if bus.currentStateHandler != nil:
     bus.notifyState(csClosed)
   if bus.stateWorker != nil and not bus.stateWorker.finished:
-    try:
-      await bus.stateWorker.wait(bus.options.operationTimeout)
-    except AsyncTimeoutError:
-      await bus.stateWorker.cancelAndWait()
+    var callbackClosing = false
+    if bus.stateHandlerTask != nil:
+      for caller in bus.closeCallers:
+        if bus.stateHandlerTask.internalChild == caller:
+          callbackClosing = true
+    if not callbackClosing:
+      try:
+        await bus.stateWorker.wait(bus.options.operationTimeout)
+      except AsyncTimeoutError:
+        await bus.stateWorker.cancelAndWait()
   bus.channels.clear()
   bus.subscriptions.setLen(0)
   bus.retiring.setLen(0)
@@ -172,4 +201,14 @@ proc joinClose(bus: InProcessPubSub): Future[void] {.async.} =
   await bus.closeTask.noCancel()
 
 method close*(bus: InProcessPubSub): Future[void] =
-  bus.joinClose()
+  result = bus.joinClose()
+  bus.closeCallers.add(result)
+
+when defined(test):
+  proc deliveryStateCountsForTest*(bus: PubSub): (int, int, int) =
+    let memoryBus = InProcessPubSub(bus)
+    (
+      memoryBus.channels.len,
+      memoryBus.subscriptions.len,
+      memoryBus.retiring.len
+    )

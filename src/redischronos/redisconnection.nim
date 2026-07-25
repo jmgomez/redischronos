@@ -142,13 +142,13 @@ proc executeImpl(connection: RedisConnection,
     raise newException(InvalidArgumentError, "Redis command must not be empty")
 
   var acquired = false
-  let started = Moment.now()
-  let admissionDeadline = started + connection.options.operationTimeout
+  let deadline = Moment.now() + connection.options.operationTimeout
   try:
-    let admissionBudget = admissionDeadline.remaining()
+    let admissionBudget = deadline.remaining()
     if admissionBudget <= 0.nanoseconds:
       raise newException(BackendTimeoutError, "Redis operation timed out")
     let acquireFuture = connection.lock.acquire()
+    var operation: Future[RespValue]
     try:
       await acquireFuture.wait(admissionBudget)
       acquired = true
@@ -159,11 +159,9 @@ proc executeImpl(connection: RedisConnection,
     if connection.isClosed:
       raise newException(BackendClosedError, "Redis connection is closed")
 
-    let establishmentDeadline =
-      Moment.now() + connection.options.connectTimeout
-    let establishment = connection.establish(establishmentDeadline)
+    let establishment = connection.establish(deadline)
     try:
-      let budget = establishmentDeadline.remaining()
+      let budget = deadline.remaining()
       if budget <= 0.nanoseconds:
         raise newException(BackendTimeoutError, "Redis handshake timed out")
       await establishment.wait(budget)
@@ -171,13 +169,11 @@ proc executeImpl(connection: RedisConnection,
       await establishment.cancelAndWait()
       await connection.disconnect()
       raise newException(BackendTimeoutError, "Redis handshake timed out")
-    let operationDeadline =
-      Moment.now() + connection.options.operationTimeout
-    let operation = connection.sendRaw(arguments)
     try:
-      let budget = operationDeadline.remaining()
+      let budget = deadline.remaining()
       if budget <= 0.nanoseconds:
         raise newException(BackendTimeoutError, "Redis operation timed out")
+      operation = connection.sendRaw(arguments)
       result = await operation.wait(budget)
     except AsyncTimeoutError:
       await operation.cancelAndWait()

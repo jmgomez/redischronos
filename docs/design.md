@@ -485,11 +485,15 @@ for the same key share one owned loader task. Cancelling one waiter never
 cancels a load still needed by another waiter; when the last waiter leaves,
 the cancellation policy decides whether the orphaned load continues. Loader
 failures and cancellations are never cached. `cfpFailOpen` treats backend read
-failures as misses and ignores backend fill failures, while `cfpPropagate`
-returns those errors.
+failures as misses, ignores backend fill failures, returns `false` for failed
+invalidation, and returns `0` for a failed version increment;
+`cfpPropagate` returns those errors. `CancelledError` is never swallowed.
 
 `invalidate` deletes one key. `versionedKey` and `bumpVersion` provide generic
 string-key versioning without imposing a serialization or domain policy.
+Invalidation and version increments advance a per-key fence and join any older
+fill before mutating the backend. Close advances a cache-wide fence before
+joining every owned read, loader, write, waiter dependency, and cleanup task.
 Closing a cache is cancellation-safe and join-idempotent: it rejects new work,
-cancels and joins owned fills, and clears per-key state. The injected
+cancels and joins owned operations, and clears per-key state. The injected
 `KvStore` remains caller-owned.
