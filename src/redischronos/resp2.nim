@@ -133,9 +133,15 @@ proc parseLine(parser: RespParser, position: int,
       nextPosition = index + 2
       return psComplete
     inc index
-  if parser.buffer.len - position > parser.maxInlineBytes:
+  var bufferedPayload = parser.buffer.len - position
+  if bufferedPayload > 0 and parser.buffer[^1] == '\r':
+    dec bufferedPayload
+  if bufferedPayload > parser.maxInlineBytes:
     raise newException(ProtocolError, "RESP line exceeds parser limit")
   psIncomplete
+
+proc bufferedBytes*(parser: RespParser): int =
+  parser.buffer.len
 
 proc parseNumber(text: string, context: string): int64 =
   var value: BiggestInt

@@ -51,13 +51,18 @@ proc openBrokenPubSub(
 suite "contract harness self-test":
   test "a deliberately broken backend fails every probe":
     check (waitFor probeKvContract(openBrokenKv)) ==
-      @["missing get", "round trip", "delete", "increment"]
+      @[
+        "missing get", "round trip", "delete", "increment", "exists",
+        "overwrite", "invalid key", "negative ttl", "closed lifecycle"
+      ]
 
   test "a deliberately broken Pub/Sub backend fails every probe":
     check (waitFor probePubSubContract(openBrokenPubSub)) == @[
       "empty publish count",
+      "invalid channel",
       "local publish count",
       "delivery",
       "unsubscribe",
+      "state notification",
       "closed lifecycle"
     ]

@@ -130,6 +130,16 @@ jitter and automatically restores current subscriptions. Messages published
 during downtime are ephemeral and are not recovered. Applications choose
 their own fail-open or fail-closed policy.
 
+DNS resolution runs off the Chronos event loop. Address candidates share one
+connect deadline; command lock admission and each command reply use one
+operation deadline. Subscriber lock, write, and acknowledgement stages share
+one absolute operation deadline. Zero or exhausted budgets start no lock or
+network operation.
+
+Close is join-idempotent and cancellation-shielded: concurrent callers wait
+for one owned cleanup task, so cancelling a caller cannot strand transports,
+delivery workers, or observers.
+
 ## Compatibility
 
 | Component | Supported |
@@ -151,6 +161,35 @@ nim c --path:src examples/backendswitch.nim
 REDISCHRONOS_URL=mem:// ./examples/backendswitch
 REDISCHRONOS_URL=redis://127.0.0.1:6379/15 ./examples/backendswitch
 ```
+
+## Opt-in cache
+
+The cache layer is separate from the umbrella API and works with either KV
+backend:
+
+```nim
+import chronos
+import redischronos
+import redischronos/cache
+
+proc main() {.async.} =
+  let store = await openKvStore("mem://")
+  let cache = newCache(store)
+  let value = await cache.getOrLoad(
+    "profile:42",
+    proc(key: string): Future[string] {.async.} =
+      return "serialized-profile"
+  )
+  echo value
+  await cache.close()
+  await store.close()
+
+waitFor main()
+```
+
+Concurrent misses for one key share a loader. `CacheOptions` controls TTL,
+backend fail-open behavior, and whether a loader with no remaining waiters is
+cancelled. The injected `KvStore` remains caller-owned.
 
 Both runs produce the same contract-observable output. Only the URL changes.
 

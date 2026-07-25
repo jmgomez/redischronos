@@ -4,6 +4,7 @@ import chronos
 import ./errors
 import ./options as backendoptions
 import ./redisurl
+import ./redisresolve
 import ./resp2
 
 type RedisConnection* = ref object
@@ -13,6 +14,7 @@ type RedisConnection* = ref object
   transport: StreamTransport
   parser: RespParser
   isClosed: bool
+  closeTask: Future[void]
 
 proc newRedisConnection*(config: RedisConfig,
     options = defaultBackendOptions()): RedisConnection =
@@ -48,7 +50,7 @@ proc readReply(connection: RedisConnection): Future[RespValue] {.async.} =
     buffer.setLen(count)
     let values = connection.parser.feed(bytesToString(buffer))
     if values.len > 0:
-      if values.len > 1:
+      if values.len > 1 or connection.parser.bufferedBytes > 0:
         raise newException(
           ProtocolError,
           "surplus reply on non-pipelined Redis connection"
@@ -84,32 +86,30 @@ proc remaining(deadline: Moment): Duration =
 proc establish(connection: RedisConnection, deadline: Moment) {.async.} =
   if connection.transport != nil:
     return
-  var addresses: seq[TransportAddress]
-  try:
-    addresses = resolveTAddress(
-      connection.config.host,
-      Port(connection.config.port)
-    )
-  except CancelledError:
-    raise
-  except CatchableError:
-    raise newException(BackendConnectionError, "Redis host resolution failed")
-  if addresses.len == 0:
-    raise newException(BackendConnectionError, "Redis host resolution failed")
-  let connectFuture = connect(addresses[0])
-  try:
-    let budget = min(connection.options.connectTimeout, deadline.remaining())
+  let addresses = await resolveRedisAddresses(
+    connection.config.host,
+    connection.config.port,
+    deadline.remaining()
+  )
+  let connectDeadline = Moment.now() + connection.options.connectTimeout
+  for address in addresses:
+    let budget = min(connectDeadline.remaining(), deadline.remaining())
     if budget <= 0.nanoseconds:
       raise newException(BackendTimeoutError, "Redis connect timed out")
-    connection.transport =
-      await connectFuture.wait(budget)
-  except AsyncTimeoutError:
-    await connectFuture.cancelAndWait()
-    raise newException(BackendTimeoutError, "Redis connect timed out")
-  except CancelledError:
-    await connectFuture.cancelAndWait()
-    raise
-  except TransportError:
+    let connectFuture = connect(address)
+    try:
+      connection.transport = await connectFuture.wait(budget)
+      break
+    except AsyncTimeoutError:
+      await connectFuture.cancelAndWait()
+    except CancelledError:
+      await connectFuture.cancelAndWait()
+      raise
+    except TransportError:
+      discard
+  if connection.transport == nil:
+    if connectDeadline.remaining() <= 0.nanoseconds:
+      raise newException(BackendTimeoutError, "Redis connect timed out")
     raise newException(BackendConnectionError, "Redis connect failed")
 
   try:
@@ -142,14 +142,15 @@ proc executeImpl(connection: RedisConnection,
     raise newException(InvalidArgumentError, "Redis command must not be empty")
 
   var acquired = false
-  let deadline = Moment.now() + connection.options.operationTimeout
+  let started = Moment.now()
+  let admissionDeadline = started + connection.options.operationTimeout
   try:
+    let admissionBudget = admissionDeadline.remaining()
+    if admissionBudget <= 0.nanoseconds:
+      raise newException(BackendTimeoutError, "Redis operation timed out")
     let acquireFuture = connection.lock.acquire()
     try:
-      let budget = deadline.remaining()
-      if budget <= 0.nanoseconds:
-        raise newException(BackendTimeoutError, "Redis operation timed out")
-      await acquireFuture.wait(budget)
+      await acquireFuture.wait(admissionBudget)
       acquired = true
     except AsyncTimeoutError:
       await acquireFuture.cancelAndWait()
@@ -158,9 +159,11 @@ proc executeImpl(connection: RedisConnection,
     if connection.isClosed:
       raise newException(BackendClosedError, "Redis connection is closed")
 
-    let establishment = connection.establish(deadline)
+    let establishmentDeadline =
+      Moment.now() + connection.options.connectTimeout
+    let establishment = connection.establish(establishmentDeadline)
     try:
-      let budget = deadline.remaining()
+      let budget = establishmentDeadline.remaining()
       if budget <= 0.nanoseconds:
         raise newException(BackendTimeoutError, "Redis handshake timed out")
       await establishment.wait(budget)
@@ -168,9 +171,11 @@ proc executeImpl(connection: RedisConnection,
       await establishment.cancelAndWait()
       await connection.disconnect()
       raise newException(BackendTimeoutError, "Redis handshake timed out")
+    let operationDeadline =
+      Moment.now() + connection.options.operationTimeout
     let operation = connection.sendRaw(arguments)
     try:
-      let budget = deadline.remaining()
+      let budget = operationDeadline.remaining()
       if budget <= 0.nanoseconds:
         raise newException(BackendTimeoutError, "Redis operation timed out")
       result = await operation.wait(budget)
@@ -201,12 +206,23 @@ proc execute*(connection: RedisConnection,
     arguments: openArray[string]): Future[RespValue] =
   connection.executeImpl(@arguments)
 
-proc close*(connection: RedisConnection): Future[void] {.async.} =
-  if connection.isClosed:
-    return
-  connection.isClosed = true
+proc closeOwned(connection: RedisConnection) {.async.} =
   await connection.lock.acquire()
   try:
     await connection.disconnect()
   finally:
     connection.lock.release()
+
+proc joinClose(connection: RedisConnection): Future[void] {.async.} =
+  if connection.closeTask == nil:
+    connection.isClosed = true
+    connection.closeTask = connection.closeOwned()
+  await connection.closeTask.noCancel()
+
+proc close*(connection: RedisConnection): Future[void] =
+  connection.joinClose()
+
+when defined(test):
+  proc setOperationTimeoutForTest*(connection: RedisConnection,
+      timeout: Duration) =
+    connection.options.operationTimeout = timeout

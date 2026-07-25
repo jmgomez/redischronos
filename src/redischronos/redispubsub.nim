@@ -1,14 +1,17 @@
-import std/[deques, options, random, sequtils, tables]
+import std/[deques, options, random, sequtils, sets, tables]
 import chronos
 
 import ./api
 import ./errors
 import ./options as backendoptions
 import ./redisconnection
+import ./redisresolve
 import ./redisurl
 import ./resp2
 
 type
+  SubscriberAdmissionTimeoutError = object of CatchableError
+
   RedisSubscription = ref object of Subscription
     id: uint64
     channel: string
@@ -28,6 +31,7 @@ type
     writeLock: AsyncLock
     channels: Table[string, seq[RedisSubscription]]
     subscriptions: seq[RedisSubscription]
+    retiring: seq[RedisSubscription]
     subscribeAcks: Table[string, Future[void]]
     unsubscribeAcks: Table[string, Future[void]]
     liveChannels: Table[string, bool]
@@ -38,6 +42,9 @@ type
     stateQueue: Deque[ConnectionState]
     stateWorker: Future[void]
     rng: Rand
+    closeTask: Future[void]
+    when defined(test):
+      reconciliationChecks: int
 
 proc writeSubscriber(bus: RedisPubSub,
     arguments: openArray[string],
@@ -79,6 +86,8 @@ proc sendHandshake(transport: StreamTransport, parser: RespParser,
 proc boundedHandshakeImpl(transport: StreamTransport, parser: RespParser,
     arguments: seq[string],
     timeout: Duration): Future[RespValue] {.async.} =
+  if timeout <= 0.nanoseconds:
+    raise newException(BackendTimeoutError, "Redis handshake timed out")
   let operation = transport.sendHandshake(parser, arguments)
   try:
     return await operation.wait(timeout)
@@ -105,32 +114,45 @@ proc requireSimple(reply: RespValue, expected: string,
 
 proc connectSubscriber(config: RedisConfig,
     options: BackendOptions): Future[(StreamTransport, RespParser)] {.async.} =
-  let addresses = resolveTAddress(config.host, Port(config.port))
-  if addresses.len == 0:
-    raise newException(BackendConnectionError, "Redis host resolution failed")
-  let connecting = connect(addresses[0])
+  let addresses = await resolveRedisAddresses(
+    config.host, config.port, options.connectTimeout
+  )
   var transport: StreamTransport
-  try:
-    transport = await connecting.wait(options.connectTimeout)
-  except AsyncTimeoutError:
-    await connecting.cancelAndWait()
-    raise newException(BackendTimeoutError, "Redis connect timed out")
-  except TransportError:
+  let connectDeadline = Moment.now() + options.connectTimeout
+  for address in addresses:
+    let budget = connectDeadline.remaining()
+    if budget <= 0.nanoseconds:
+      raise newException(BackendTimeoutError, "Redis connect timed out")
+    let connecting = connect(address)
+    try:
+      transport = await connecting.wait(budget)
+      break
+    except AsyncTimeoutError:
+      await connecting.cancelAndWait()
+    except CancelledError:
+      await connecting.cancelAndWait()
+      raise
+    except TransportError:
+      discard
+  if transport == nil:
+    if connectDeadline.remaining() <= 0.nanoseconds:
+      raise newException(BackendTimeoutError, "Redis connect timed out")
     raise newException(BackendConnectionError, "Redis connect failed")
 
   let parser = newRespParser()
+  let handshakeDeadline = Moment.now() + options.operationTimeout
   try:
     if config.password.isSome:
       let reply =
         if config.username.isSome:
           await transport.boundedHandshake(parser, [
             "AUTH", config.username.get, config.password.get
-          ], options.operationTimeout)
+          ], handshakeDeadline.remaining())
         else:
           await transport.boundedHandshake(
             parser,
             ["AUTH", config.password.get],
-            options.operationTimeout
+            handshakeDeadline.remaining()
           )
       requireSimple(reply, "OK", authentication = true)
     if config.database != 0:
@@ -138,7 +160,7 @@ proc connectSubscriber(config: RedisConfig,
         await transport.boundedHandshake(
           parser,
           ["SELECT", $config.database],
-          options.operationTimeout
+          handshakeDeadline.remaining()
         ),
         "OK"
       )
@@ -146,7 +168,7 @@ proc connectSubscriber(config: RedisConfig,
       await transport.boundedHandshake(
         parser,
         ["PING"],
-        options.operationTimeout
+        handshakeDeadline.remaining()
       ),
       "PONG"
     )
@@ -191,7 +213,9 @@ proc deliver(subscription: RedisSubscription) {.async.} =
 proc dispatch(bus: RedisPubSub, channel, payload: string) =
   if not bus.channels.hasKey(channel):
     return
-  let snapshot = bus.channels[channel]
+  var snapshot = newSeqOfCap[RedisSubscription](bus.channels[channel].len)
+  for subscription in bus.channels[channel]:
+    snapshot.add(subscription)
   for subscription in snapshot:
     if subscription.active:
       if subscription.queue.len <
@@ -239,13 +263,23 @@ proc hasDesiredChannel(bus: RedisPubSub, channel: string): bool =
     if subscription.active:
       return true
 
-proc desiredChannels(bus: RedisPubSub): seq[string] =
+proc desiredChannels(bus: RedisPubSub): HashSet[string] =
+  result = initHashSet[string]()
   for channel in bus.channels.keys:
+    when defined(test):
+      inc bus.reconciliationChecks
     if bus.hasDesiredChannel(channel):
-      result.add(channel)
+      result.incl(channel)
 
 proc waitForChannelState(bus: RedisPubSub, transport: StreamTransport,
-    parser: RespParser, channel: string, subscribed: bool) {.async.} =
+    parser: RespParser, channel: string, subscribed: bool,
+    deadline: Moment) {.async.} =
+  let budget = deadline.remaining()
+  if budget <= 0.nanoseconds:
+    raise newException(
+      BackendTimeoutError,
+      "Redis subscription acknowledgement timed out"
+    )
   let operation = proc() {.async.} =
     while bus.liveChannels.hasKey(channel) != subscribed:
       let values = parser.feed(await transport.readSome())
@@ -253,7 +287,7 @@ proc waitForChannelState(bus: RedisPubSub, transport: StreamTransport,
         bus.handleFrame(value)
   let waiting = operation()
   try:
-    await waiting.wait(bus.options.operationTimeout)
+    await waiting.wait(budget)
   except AsyncTimeoutError:
     await waiting.cancelAndWait()
     raise newException(
@@ -262,39 +296,53 @@ proc waitForChannelState(bus: RedisPubSub, transport: StreamTransport,
     )
 
 proc writeCandidateImpl(bus: RedisPubSub, transport: StreamTransport,
-    arguments: seq[string]) {.async.} =
+    arguments: seq[string], deadline: Moment) {.async.} =
+  let budget = deadline.remaining()
+  if budget <= 0.nanoseconds:
+    raise newException(BackendTimeoutError, "Redis subscriber write timed out")
   let writing = transport.write(encodeCommand(arguments))
   try:
-    discard await writing.wait(bus.options.operationTimeout)
+    discard await writing.wait(budget)
   except AsyncTimeoutError:
     await writing.cancelAndWait()
     raise newException(BackendTimeoutError, "Redis subscriber write timed out")
 
 proc writeCandidate(bus: RedisPubSub, transport: StreamTransport,
-    arguments: openArray[string]): Future[void] =
-  bus.writeCandidateImpl(transport, @arguments)
+    arguments: openArray[string], deadline: Moment): Future[void] =
+  bus.writeCandidateImpl(transport, @arguments, deadline)
 
 proc reconcileCandidate(bus: RedisPubSub, transport: StreamTransport,
     parser: RespParser) {.async.} =
+  let deadline = Moment.now() + bus.options.operationTimeout
   while true:
     let desired = bus.desiredChannels()
     for channel in desired:
+      when defined(test):
+        inc bus.reconciliationChecks
       if not bus.liveChannels.hasKey(channel):
-        await bus.writeCandidate(transport, ["SUBSCRIBE", channel])
-        await bus.waitForChannelState(transport, parser, channel, true)
+        await bus.writeCandidate(transport, ["SUBSCRIBE", channel], deadline)
+        await bus.waitForChannelState(
+          transport, parser, channel, true, deadline
+        )
 
     var stale: seq[string]
     for channel in bus.liveChannels.keys:
-      if channel notin bus.desiredChannels():
+      when defined(test):
+        inc bus.reconciliationChecks
+      if channel notin desired:
         stale.add(channel)
     for channel in stale:
-      await bus.writeCandidate(transport, ["UNSUBSCRIBE", channel])
-      await bus.waitForChannelState(transport, parser, channel, false)
+      await bus.writeCandidate(transport, ["UNSUBSCRIBE", channel], deadline)
+      await bus.waitForChannelState(
+        transport, parser, channel, false, deadline
+      )
 
     let currentDesired = bus.desiredChannels()
     var converged = currentDesired.len == bus.liveChannels.len
     if converged:
       for channel in currentDesired:
+        when defined(test):
+          inc bus.reconciliationChecks
         if not bus.liveChannels.hasKey(channel):
           converged = false
     if converged:
@@ -394,17 +442,20 @@ proc requireOpen(bus: RedisPubSub) =
 
 proc writeSubscriberImpl(bus: RedisPubSub,
     arguments: seq[string], deadline: Moment) {.async.} =
+  let admissionBudget = deadline.remaining()
+  if admissionBudget <= 0.nanoseconds:
+    raise newException(BackendTimeoutError, "Redis subscriber write timed out")
   let acquiring = bus.writeLock.acquire()
   var acquired = false
   try:
-    let budget = deadline.remaining()
-    if budget <= 0.nanoseconds:
-      raise newException(BackendTimeoutError, "Redis subscriber write timed out")
-    await acquiring.wait(budget)
+    await acquiring.wait(admissionBudget)
     acquired = true
   except AsyncTimeoutError:
     await acquiring.cancelAndWait()
-    raise newException(BackendTimeoutError, "Redis subscriber write timed out")
+    raise newException(
+      SubscriberAdmissionTimeoutError,
+      "Redis subscriber lock timed out"
+    )
   try:
     let writing = bus.subscriber.write(encodeCommand(arguments))
     try:
@@ -417,10 +468,17 @@ proc writeSubscriberImpl(bus: RedisPubSub,
       discard await writing.wait(budget)
     except AsyncTimeoutError:
       await writing.cancelAndWait()
+      if bus.subscriber != nil:
+        bus.subscriber.close()
       raise newException(
         BackendTimeoutError,
         "Redis subscriber write timed out"
       )
+    except CancelledError:
+      await writing.cancelAndWait()
+      if bus.subscriber != nil:
+        bus.subscriber.close()
+      raise
   finally:
     if acquired:
       bus.writeLock.release()
@@ -450,6 +508,13 @@ method subscribe*(bus: RedisPubSub, channel: string,
   if first:
     if not bus.connected:
       return subscription
+    if bus.options.operationTimeout <= 0.nanoseconds:
+      subscription.active = false
+      bus.subscriptions.keepItIf(it != subscription)
+      bus.channels[channel].keepItIf(it != subscription)
+      if bus.channels[channel].len == 0:
+        bus.channels.del(channel)
+      raise newException(BackendTimeoutError, "Redis subscribe timed out")
     let acknowledgement = newFuture[void]("RedisPubSub.subscribe")
     bus.subscribeAcks[channel] = acknowledgement
     let deadline = Moment.now() + bus.options.operationTimeout
@@ -471,6 +536,15 @@ method subscribe*(bus: RedisPubSub, channel: string,
       if bus.subscriber != nil:
         bus.subscriber.close()
       raise newException(BackendTimeoutError, "Redis subscribe timed out")
+    except SubscriberAdmissionTimeoutError:
+      if bus.subscribeAcks.hasKey(channel):
+        bus.subscribeAcks.del(channel)
+      subscription.active = false
+      bus.subscriptions.keepItIf(it != subscription)
+      bus.channels[channel].keepItIf(it != subscription)
+      if bus.channels[channel].len == 0:
+        bus.channels.del(channel)
+      raise newException(BackendTimeoutError, "Redis subscribe timed out")
     except CancelledError:
       if bus.subscribeAcks.hasKey(channel):
         bus.subscribeAcks.del(channel)
@@ -480,8 +554,6 @@ method subscribe*(bus: RedisPubSub, channel: string,
       bus.channels[channel].keepItIf(it != subscription)
       if bus.channels[channel].len == 0:
         bus.channels.del(channel)
-      if bus.subscriber != nil:
-        bus.subscriber.close()
       raise
     except CatchableError:
       if bus.subscribeAcks.hasKey(channel):
@@ -507,6 +579,9 @@ method unsubscribe*(bus: RedisPubSub,
     return
   redisSubscription.active = false
   redisSubscription.queue.clear()
+  if redisSubscription.worker != nil and
+      not redisSubscription.worker.finished:
+    bus.retiring.add(redisSubscription)
   var remaining = false
   for item in bus.channels[redisSubscription.channel]:
     if item.active:
@@ -521,6 +596,14 @@ method unsubscribe*(bus: RedisPubSub,
   if not remaining:
     if not bus.connected:
       return
+    if bus.options.operationTimeout <= 0.nanoseconds:
+      redisSubscription.active = true
+      bus.retiring.keepItIf(it != redisSubscription)
+      bus.channels.mgetOrPut(
+        redisSubscription.channel, @[]
+      ).add(redisSubscription)
+      bus.subscriptions.add(redisSubscription)
+      raise newException(BackendTimeoutError, "Redis unsubscribe timed out")
     let acknowledgement = newFuture[void]("RedisPubSub.unsubscribe")
     bus.unsubscribeAcks[redisSubscription.channel] = acknowledgement
     let deadline = Moment.now() + bus.options.operationTimeout
@@ -539,11 +622,13 @@ method unsubscribe*(bus: RedisPubSub,
       if bus.subscriber != nil:
         bus.subscriber.close()
       raise newException(BackendTimeoutError, "Redis unsubscribe timed out")
+    except SubscriberAdmissionTimeoutError:
+      if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
+        bus.unsubscribeAcks.del(redisSubscription.channel)
+      raise newException(BackendTimeoutError, "Redis unsubscribe timed out")
     except CancelledError:
       if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
         bus.unsubscribeAcks.del(redisSubscription.channel)
-      if bus.subscriber != nil:
-        bus.subscriber.close()
       raise
     except CatchableError:
       if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
@@ -568,6 +653,8 @@ method publish*(bus: RedisPubSub, channel,
 
 method onStateChange*(bus: RedisPubSub,
     handler: StateHandler) {.gcsafe.} =
+  if bus.isClosed:
+    return
   bus.currentStateHandler = handler
   let state =
     if bus.isClosed: csClosed
@@ -575,10 +662,7 @@ method onStateChange*(bus: RedisPubSub,
     else: csDisconnected
   bus.notifyState(state)
 
-method close*(bus: RedisPubSub): Future[void] {.async.} =
-  if bus.isClosed:
-    return
-  bus.isClosed = true
+proc closeOwned(bus: RedisPubSub) {.async.} =
   let closedError =
     newException(BackendClosedError, "pub/sub backend is closed")
   for _, acknowledgement in bus.subscribeAcks.pairs:
@@ -591,6 +675,10 @@ method close*(bus: RedisPubSub): Future[void] {.async.} =
   bus.unsubscribeAcks.clear()
   for subscription in bus.subscriptions:
     subscription.active = false
+  for subscription in bus.retiring:
+    subscription.active = false
+  let owned = bus.subscriptions & bus.retiring
+  for subscription in owned:
     if subscription.worker != nil and not subscription.worker.finished:
       await subscription.worker.cancelAndWait()
   if bus.reader != nil and not bus.reader.finished:
@@ -604,9 +692,54 @@ method close*(bus: RedisPubSub): Future[void] {.async.} =
       await bus.stateWorker.wait(bus.options.operationTimeout)
     except AsyncTimeoutError:
       await bus.stateWorker.cancelAndWait()
+  bus.channels.clear()
+  bus.subscriptions.setLen(0)
+  bus.retiring.setLen(0)
+  bus.liveChannels.clear()
+  bus.stateQueue.clear()
+  bus.currentStateHandler = nil
+
+proc joinClose(bus: RedisPubSub): Future[void] {.async.} =
+  if bus.closeTask == nil:
+    bus.isClosed = true
+    bus.closeTask = bus.closeOwned()
+  await bus.closeTask.noCancel()
+
+method close*(bus: RedisPubSub): Future[void] =
+  bus.joinClose()
 
 when defined(test):
   proc disconnectSubscriberForTest*(bus: PubSub) {.async.} =
     let redisBus = RedisPubSub(bus)
     if redisBus.subscriber != nil:
       await redisBus.subscriber.closeWait()
+
+  proc holdSubscriberWriteLockForTest*(bus: PubSub,
+      acquired, release: Future[void]) {.async.} =
+    let redisBus = RedisPubSub(bus)
+    await redisBus.writeLock.acquire()
+    acquired.complete()
+    try:
+      await release
+    finally:
+      redisBus.writeLock.release()
+
+  proc setOperationTimeoutForTest*(bus: PubSub, timeout: Duration) =
+    RedisPubSub(bus).options.operationTimeout = timeout
+
+  proc seedDesiredChannelsForTest*(bus: PubSub, count: int) =
+    let redisBus = RedisPubSub(bus)
+    for index in 0 ..< count:
+      inc redisBus.nextId
+      let subscription = RedisSubscription(
+        id: redisBus.nextId,
+        channel: "reconciliation:" & $index,
+        active: true,
+        owner: redisBus
+      )
+      redisBus.subscriptions.add(subscription)
+      redisBus.channels.mgetOrPut(subscription.channel, @[]).add(subscription)
+    redisBus.reconciliationChecks = 0
+
+  proc reconciliationChecksForTest*(bus: PubSub): int =
+    RedisPubSub(bus).reconciliationChecks

@@ -21,11 +21,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        nim: ["2.2.0", "2.2.10"]
         mm: [refc, orc]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify preinstalled toolchain
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.nim }}
+
+      - name: Verify pinned toolchain
         run: |
           nim --version
           nimble --version
@@ -50,5 +55,14 @@ jobs:
           REDIS_TEST_URL: redis://audituser:acl-password@127.0.0.1:6379/15
         run: nim c --mm:${{ matrix.mm }} --path:src -d:test -d:redisIntegration -r tests/tall.nim
 
+      - name: Prove configuration-only backend switching
+        env:
+          REDISCHRONOS_URL: redis://audituser:acl-password@127.0.0.1:6379/15
+        run: |
+          nim c --mm:${{ matrix.mm }} --path:src -o:/tmp/redischronos-backendswitch examples/backendswitch.nim
+          REDISCHRONOS_URL=mem:// /tmp/redischronos-backendswitch > /tmp/redischronos-memory.out
+          /tmp/redischronos-backendswitch > /tmp/redischronos-redis.out
+          diff -u /tmp/redischronos-memory.out /tmp/redischronos-redis.out
+
       - name: Verify Redis was restored by the outage contract
-        run: timeout 30s sh -c 'until docker exec "${{ job.services.redis.id }}" redis-cli ping | grep -q PONG; do sleep 1; done'
+        run: timeout 30s sh -c 'until docker exec "${{ job.services.redis.id }}" redis-cli -a audit-password ping 2>/dev/null | grep -q PONG; do sleep 1; done'

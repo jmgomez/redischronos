@@ -12,6 +12,7 @@ tests/tmemorypubsub
 tests/tredisconnection
 tests/trediskv
 tests/tredispubsub
+tests/tredispubsubfaults
 tests/tredisoutage
 tests/tredisurl
 tests/tresp2

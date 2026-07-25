@@ -21,7 +21,7 @@ when defined(redisIntegration):
             ) == 0
           let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
           var states: seq[ConnectionState]
-          var activeMessages, removedMessages: int
+          var activeMessages, addedMessages, removedMessages: int
           bus.onStateChange(
             proc(state: ConnectionState): Future[void] {.async.} =
               states.add(state)
@@ -32,6 +32,9 @@ when defined(redisIntegration):
           let removedHandler: MessageHandler =
             proc(channel, payload: string): Future[void] {.async.} =
               inc removedMessages
+          let addedHandler: MessageHandler =
+            proc(channel, payload: string): Future[void] {.async.} =
+              inc addedMessages
           discard await bus.subscribe("redischronos:outage:active", activeHandler)
           let removed =
             await bus.subscribe("redischronos:outage:removed", removedHandler)
@@ -47,7 +50,7 @@ when defined(redisIntegration):
             await bus.unsubscribe(removed)
             discard await bus.subscribe(
               "redischronos:outage:added",
-              activeHandler
+              addedHandler
             )
             await sleepAsync(350.milliseconds)
             check execCmd("docker start " & quoteShell(redisContainer)) == 0
@@ -65,7 +68,8 @@ when defined(redisIntegration):
               "redischronos:outage:added", "two"
             )) == 1
             await sleepAsync(50.milliseconds)
-            check activeMessages == 2
+            check activeMessages == 1
+            check addedMessages == 1
             check removedMessages == 0
 
             check execCmd("docker stop " & quoteShell(redisContainer)) == 0
@@ -105,14 +109,14 @@ when defined(redisIntegration):
             check bus != nil
 
             var states: seq[ConnectionState]
-            var messages = 0
+            var originalMessages, addedMessages: int
             bus.onStateChange(
               proc(state: ConnectionState): Future[void] {.async.} =
                 states.add(state)
             )
             let handler: MessageHandler =
               proc(channel, payload: string): Future[void] {.async.} =
-                inc messages
+                inc originalMessages
             discard await bus.subscribe("redischronos:local-outage", handler)
 
             redis.stop()
@@ -121,6 +125,12 @@ when defined(redisIntegration):
                 break
               await sleepAsync(20.milliseconds)
             check csDisconnected in states
+            let addedHandler: MessageHandler =
+              proc(channel, payload: string): Future[void] {.async.} =
+                inc addedMessages
+            discard await bus.subscribe(
+              "redischronos:local-outage-added", addedHandler
+            )
             await sleepAsync(350.milliseconds)
 
             redis = launch()
@@ -132,8 +142,12 @@ when defined(redisIntegration):
             check (await bus.publish(
               "redischronos:local-outage", "recovered"
             )) == 1
+            check (await bus.publish(
+              "redischronos:local-outage-added", "recovered"
+            )) == 1
             await sleepAsync(50.milliseconds)
-            check messages == 1
+            check originalMessages == 1
+            check addedMessages == 1
 
             redis.stop()
             await bus.close().wait(1.seconds)

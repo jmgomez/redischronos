@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-07-25
 
 - Make Redis command close/admission races terminal and preserve active
   commands when queued waiters are cancelled.
@@ -13,6 +13,8 @@
   replies, and enforce end-to-end command deadlines with typed DNS failures.
 - Add sustained real-Redis outage, password/ACL, and stronger broken-backend
   contract evidence to the refc/ORC matrix.
+- Add an opt-in backend-neutral cache with coalesced fills, configurable
+  cancellation/failure policy, TTL, invalidation, and version helpers.
 
 ## 1.0.0 — 2026-07-25
 

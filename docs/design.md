@@ -219,6 +219,10 @@ must redact credentials and command payloads.
   later transition, so a handler registered after `openPubSub` cannot miss the
   initial connected state.
 - Repeated `close` succeeds and terminates subscriptions and background tasks.
+- Concurrent `close` calls join one cancellation-shielded cleanup task. A
+  cancelled caller cannot cancel transport, worker, or observer cleanup.
+- Registering a state observer after terminal close is inert and starts no
+  background task.
 
 ### 5.3 Concurrency
 
@@ -456,3 +460,36 @@ The operational switch is then:
 4. Restart and verify health.
 
 No change to this library is part of those deployment steps.
+
+## 11. Opt-in cache layer
+
+`import redischronos/cache` exposes a backend-neutral cache layered only on an
+injected `KvStore`. It is intentionally not re-exported by the umbrella
+module.
+
+```nim
+type
+  CacheLoader = proc(key: string): Future[string] {.gcsafe.}
+  CacheCancellationPolicy = enum
+    ccpContinueOrphaned, ccpCancelOrphaned
+  CacheFailurePolicy = enum
+    cfpPropagate, cfpFailOpen
+  CacheOptions = object
+    ttlSeconds: int
+    cancellationPolicy: CacheCancellationPolicy
+    failurePolicy: CacheFailurePolicy
+```
+
+`getOrLoad` returns a stored hit without invoking the loader. Concurrent misses
+for the same key share one owned loader task. Cancelling one waiter never
+cancels a load still needed by another waiter; when the last waiter leaves,
+the cancellation policy decides whether the orphaned load continues. Loader
+failures and cancellations are never cached. `cfpFailOpen` treats backend read
+failures as misses and ignores backend fill failures, while `cfpPropagate`
+returns those errors.
+
+`invalidate` deletes one key. `versionedKey` and `bumpVersion` provide generic
+string-key versioning without imposing a serialization or domain policy.
+Closing a cache is cancellation-safe and join-idempotent: it rejects new work,
+cancels and joins owned fills, and clears per-key state. The injected
+`KvStore` remains caller-owned.

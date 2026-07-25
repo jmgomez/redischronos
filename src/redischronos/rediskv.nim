@@ -11,6 +11,7 @@ import ./resp2
 type RedisKvStore* = ref object of KvStore
   connection: RedisConnection
   isClosed: bool
+  closeTask: Future[void]
 
 proc newRedisKvStore*(url: string,
     options = defaultBackendOptions()): RedisKvStore =
@@ -78,8 +79,14 @@ method increment*(store: RedisKvStore,
     raise newException(ProtocolError, "unexpected Redis INCR reply")
   return reply.integer
 
-method close*(store: RedisKvStore): Future[void] {.async.} =
-  if store.isClosed:
-    return
-  store.isClosed = true
+proc closeOwned(store: RedisKvStore) {.async.} =
   await store.connection.close()
+
+proc joinClose(store: RedisKvStore): Future[void] {.async.} =
+  if store.closeTask == nil:
+    store.isClosed = true
+    store.closeTask = store.closeOwned()
+  await store.closeTask.noCancel()
+
+method close*(store: RedisKvStore): Future[void] =
+  store.joinClose()

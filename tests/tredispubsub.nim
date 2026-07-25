@@ -151,3 +151,155 @@ when defined(redisIntegration):
         check calls[0] > 0
         await bus.close()
       waitFor exercise()
+
+    test "callback mutations use stable snapshots":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        var calls: seq[string]
+        var self, peer: Subscription
+        let replacement: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            calls.add("replacement:" & payload)
+        let peerHandler: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            calls.add("peer:" & payload)
+        let mutating: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            calls.add("self:" & payload)
+            await bus.unsubscribe(self)
+            await bus.unsubscribe(peer)
+            discard await bus.subscribe(channel, replacement)
+        self = await bus.subscribe("redischronos:mutations", mutating)
+        peer = await bus.subscribe("redischronos:mutations", peerHandler)
+        discard await bus.publish("redischronos:mutations", "first")
+        await sleepAsync(30.milliseconds)
+        discard await bus.publish("redischronos:mutations", "second")
+        await sleepAsync(30.milliseconds)
+        check "self:first" in calls
+        check "peer:second" notin calls
+        check "replacement:second" in calls
+        await bus.close()
+      waitFor exercise()
+
+    test "a callback can close its bus without deadlocking":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let returned = newFuture[void]("Redis callback close returned")
+        discard await bus.subscribe(
+          "redischronos:callback-close",
+          proc(channel, payload: string): Future[void] {.async.} =
+            discard bus.close()
+            returned.complete()
+        )
+        discard await bus.publish(
+          "redischronos:callback-close", "payload"
+        )
+        await returned.wait(200.milliseconds)
+        await bus.close().wait(200.milliseconds)
+        expect BackendClosedError:
+          discard await bus.publish(
+            "redischronos:callback-close", "after close"
+          )
+      waitFor exercise()
+
+    test "bounded queues and retiring workers remain owned through close":
+      proc exercise() {.async.} =
+        var options = defaultBackendOptions()
+        options.pubSubMaxPendingMessages = 2
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"), options)
+        let started = newFuture[void]("Redis slow handler started")
+        var terminated = false
+        var calls = 0
+        let handler: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            inc calls
+            if not started.finished:
+              started.complete()
+            try:
+              await sleepAsync(1.hours)
+            finally:
+              terminated = true
+        let subscription =
+          await bus.subscribe("redischronos:bounded", handler)
+        discard await bus.publish("redischronos:bounded", "first")
+        await started
+        for payload in ["second", "third", "dropped"]:
+          discard await bus.publish("redischronos:bounded", payload)
+        await sleepAsync(30.milliseconds)
+        await bus.unsubscribe(subscription)
+        let first = bus.close()
+        let second = bus.close()
+        first.cancelSoon()
+        await first
+        await second
+        check calls == 1
+        check terminated
+      waitFor exercise()
+
+    test "observer replacement and post-close registration own no stray task":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        var firstCalls, secondCalls, postCloseCalls: int
+        bus.onStateChange(
+          proc(state: ConnectionState): Future[void] {.async.} =
+            inc firstCalls
+        )
+        bus.onStateChange(
+          proc(state: ConnectionState): Future[void] {.async.} =
+            inc secondCalls
+        )
+        await sleepAsync(10.milliseconds)
+        await bus.close()
+        bus.onStateChange(
+          proc(state: ConnectionState): Future[void] {.async.} =
+            inc postCloseCalls
+        )
+        await sleepAsync(10.milliseconds)
+        check firstCalls + secondCalls >= 2
+        check postCloseCalls == 0
+      waitFor exercise()
+
+    test "queued subscriber writer cancellation preserves the connection":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let acquired = newFuture[void]("subscriber lock acquired")
+        let release = newFuture[void]("subscriber lock release")
+        let holder =
+          bus.holdSubscriberWriteLockForTest(acquired, release)
+        await acquired
+        let handler: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            discard
+        let queued = bus.subscribe("redischronos:cancelled-writer", handler)
+        queued.cancelSoon()
+        expect CancelledError:
+          discard await queued
+        release.complete()
+        await holder
+        let subscription =
+          await bus.subscribe("redischronos:after-cancel", handler)
+        check (await bus.publish(
+          "redischronos:after-cancel", "payload"
+        )) == 1
+        await bus.unsubscribe(subscription)
+        await bus.close()
+      waitFor exercise()
+
+    test "an expired subscriber budget starts no write and poisons no lock":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let handler: MessageHandler =
+          proc(channel, payload: string): Future[void] {.async.} =
+            discard
+        bus.setOperationTimeoutForTest(0.nanoseconds)
+        expect BackendTimeoutError:
+          discard await bus.subscribe("redischronos:expired", handler)
+        bus.setOperationTimeoutForTest(1.seconds)
+        let subscription =
+          await bus.subscribe("redischronos:after-expired", handler)
+        check (await bus.publish(
+          "redischronos:after-expired", "payload"
+        )) == 1
+        await bus.unsubscribe(subscription)
+        await bus.close()
+      waitFor exercise()

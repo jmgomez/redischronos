@@ -132,3 +132,8 @@ suite "RESP2 incremental parser":
       expect ProtocolError:
         for fragment in fragments:
           discard parser.feed(fragment)
+
+    let exact = newRespParser(maxInlineBytes = 16)
+    check exact.feed("+" & repeat("x", 16) & "\r") ==
+      newSeq[RespValue]()
+    check exact.feed("\n") == @[simpleString(repeat("x", 16))]

@@ -5,16 +5,18 @@ import redischronos
 import ./tmemorykv
 import ./tmemorypubsub
 import ./tcontractharness
+import ./tcache
 import ./tresp2
 import ./tredisurl
 import ./tredisconnection
 import ./trediskv
 import ./tredispubsub
+import ./tredispubsubfaults
 import ./tredisoutage
 
 suite "public contracts":
   test "exposes the stable release version":
-    check redischronosVersion == "1.0.0"
+    check redischronosVersion == "1.1.0"
 
   test "default options match the documented contract":
     let options = defaultBackendOptions()

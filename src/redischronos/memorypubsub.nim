@@ -18,12 +18,14 @@ type
   InProcessPubSub* = ref object of PubSub
     channels: Table[string, seq[MemorySubscription]]
     subscriptions: seq[MemorySubscription]
+    retiring: seq[MemorySubscription]
     nextId: uint64
     isClosed: bool
     options: BackendOptions
     currentStateHandler: StateHandler
     stateQueue: Deque[ConnectionState]
     stateWorker: Future[void]
+    closeTask: Future[void]
 
 proc newInProcessPubSub*(options: BackendOptions): PubSub =
   if options.pubSubMaxPendingMessages <= 0:
@@ -109,6 +111,9 @@ method unsubscribe*(bus: InProcessPubSub,
     if memorySubscription.owner == bus and memorySubscription.active:
       memorySubscription.active = false
       memorySubscription.queue.clear()
+      if memorySubscription.worker != nil and
+          not memorySubscription.worker.finished:
+        bus.retiring.add(memorySubscription)
       let channel = memorySubscription.channel
       bus.subscriptions.keepItIf(it != memorySubscription)
       if bus.channels.hasKey(channel):
@@ -122,7 +127,9 @@ method publish*(bus: InProcessPubSub, channel,
   requireChannel(channel)
   if not bus.channels.hasKey(channel):
     return 0
-  let snapshot = bus.channels[channel]
+  var snapshot = newSeqOfCap[MemorySubscription](bus.channels[channel].len)
+  for subscription in bus.channels[channel]:
+    snapshot.add(subscription)
   for subscription in snapshot:
     if subscription.active:
       if subscription.queue.len < bus.options.pubSubMaxPendingMessages:
@@ -131,17 +138,18 @@ method publish*(bus: InProcessPubSub, channel,
       inc result
 
 method onStateChange*(bus: InProcessPubSub, handler: StateHandler) {.gcsafe.} =
-  bus.currentStateHandler = handler
-  let state = if bus.isClosed: csClosed else: csConnected
-  bus.notifyState(state)
-
-method close*(bus: InProcessPubSub): Future[void] {.async.} =
   if bus.isClosed:
     return
-  bus.isClosed = true
+  bus.currentStateHandler = handler
+  bus.notifyState(csConnected)
+
+proc closeOwned(bus: InProcessPubSub) {.async.} =
   for subscription in bus.subscriptions:
     subscription.active = false
-  for subscription in bus.subscriptions:
+  for subscription in bus.retiring:
+    subscription.active = false
+  let owned = bus.subscriptions & bus.retiring
+  for subscription in owned:
     if subscription.worker != nil and not subscription.worker.finished:
       await subscription.worker.cancelAndWait()
   if bus.currentStateHandler != nil:
@@ -153,3 +161,15 @@ method close*(bus: InProcessPubSub): Future[void] {.async.} =
       await bus.stateWorker.cancelAndWait()
   bus.channels.clear()
   bus.subscriptions.setLen(0)
+  bus.retiring.setLen(0)
+  bus.stateQueue.clear()
+  bus.currentStateHandler = nil
+
+proc joinClose(bus: InProcessPubSub): Future[void] {.async.} =
+  if bus.closeTask == nil:
+    bus.isClosed = true
+    bus.closeTask = bus.closeOwned()
+  await bus.closeTask.noCancel()
+
+method close*(bus: InProcessPubSub): Future[void] =
+  bus.joinClose()

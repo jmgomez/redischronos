@@ -15,7 +15,36 @@ proc probeKvContract*(factory: KvFactory): Future[seq[string]] {.async.} =
     result.add("delete")
   if (await store.increment("counter")) != 1:
     result.add("increment")
+  try:
+    if not (await store.exists("roundtrip")):
+      result.add("exists")
+  except CatchableError:
+    result.add("exists")
+  await store.set("roundtrip", "overwritten")
+  if (await store.get("roundtrip")) != some("overwritten"):
+    result.add("overwrite")
+  try:
+    discard await store.get("")
+    result.add("invalid key")
+  except InvalidArgumentError:
+    discard
+  except CatchableError:
+    result.add("invalid key")
+  try:
+    await store.set("roundtrip", "invalid ttl", -1)
+    result.add("negative ttl")
+  except InvalidArgumentError:
+    discard
+  except CatchableError:
+    result.add("negative ttl")
   await store.close()
+  try:
+    discard await store.get("closed")
+    result.add("closed lifecycle")
+  except BackendClosedError:
+    discard
+  except CatchableError:
+    result.add("closed lifecycle")
 
 template kvContractSuite*(backendName: string, factory: KvFactory) =
   suite backendName & " KV contract":
@@ -86,6 +115,8 @@ template kvContractSuite*(backendName: string, factory: KvFactory) =
           expect RedisCommandError:
             discard await store.increment("expiring-contract-counter")
           check (await store.get("expiring-contract-counter")) == some(value)
+          await sleepAsync(1100.milliseconds)
+          check (await store.get("expiring-contract-counter")).isNone
         await store.close()
       waitFor exercise()
 
