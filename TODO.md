@@ -12,7 +12,7 @@ items merely because their design is complete.
 
 ## Phase 1 — memory-only release (`v0.1.0`)
 
-- [ ] **P1.1 — Freeze the public contracts and errors test-first.** RED:
+- [x] **P1.1 — Freeze the public contracts and errors test-first.** RED:
   add compile-time and runtime tests for `BackendOptions`, typed errors,
   handler-error observer, abstract `KvStore`/`PubSub`, subscription identity,
   factories, and idempotent lifecycle. GREEN: implement only `api.nim`,
@@ -20,33 +20,33 @@ items merely because their design is complete.
   compiles; unknown URL schemes fail explicitly; empty URL and `mem://` choose
   memory; no Redis modules are needed.
 
-- [ ] **P1.2 — Implement basic in-memory KV round-trips.** RED: parameterized
+- [x] **P1.2 — Implement basic in-memory KV round-trips.** RED: parameterized
   contract tests for missing get, binary-safe set/get, overwrite, delete
   boolean, exists agreement, empty value, and invalid empty keys. GREEN:
   implement the smallest `InMemoryKvStore` table and wire `openKvStore`.
   ACCEPT: focused tests and the full refc/ORC suite pass with no network.
 
-- [ ] **P1.3 — Add TTL behavior.** RED: tests prove no-expiry entries remain,
+- [x] **P1.3 — Add TTL behavior.** RED: tests prove no-expiry entries remain,
   positive-TTL entries disappear, negative TTL is rejected, overwrite resets
   TTL, and expired entries are never returned by exists/increment. Prefer an
   injected clock or deterministic test seam over sleeps. GREEN: add lazy
   expiry. ACCEPT: tests are deterministic under repeated runs and both memory
   managers.
 
-- [ ] **P1.4 — Add bounded deterministic LRU eviction.** RED: tests cover
+- [x] **P1.4 — Add bounded deterministic LRU eviction.** RED: tests cover
   configured capacity, read-refreshes-recency, overwrite behavior, expired
   entries purged before live eviction, and deterministic tie-breaking. GREEN:
   add the access counter and eviction path without a background sweeper.
   ACCEPT: entry count never exceeds `memoryMaxEntries`; capacity zero/negative
   configuration is rejected; contract still permits early loss under pressure.
 
-- [ ] **P1.5 — Add atomic increment semantics.** RED: tests cover missing→1,
+- [x] **P1.5 — Add atomic increment semantics.** RED: tests cover missing→1,
   monotonic increments, negative stored integers, overflow, non-integer
   preservation, and many interleaved increments on one Chronos loop. GREEN:
   implement parse/check/store without an await between read and write. ACCEPT:
   no lost updates and Redis-compatible error behavior.
 
-- [ ] **P1.6 — Implement in-process Pub/Sub.** RED: tests cover exact-channel
+- [x] **P1.6 — Implement in-process Pub/Sub.** RED: tests cover exact-channel
   isolation, multiple subscribers, publish count, no-subscriber publish,
   idempotent unsubscribe, subscribe/unsubscribe inside a callback, ordered
   delivery, one failed handler not killing others, and redacted handler-error
@@ -54,13 +54,13 @@ items merely because their design is complete.
   subscription handles. ACCEPT: no retained history, no iterator corruption,
   payloads never enter error events, and all tasks are drained on close.
 
-- [ ] **P1.7 — Complete lifecycle and state semantics.** RED: tests cover
+- [x] **P1.7 — Complete lifecycle and state semantics.** RED: tests cover
   connected/closed notifications, operations after close, double close,
   close with active subscriptions, and cancellation during handler execution.
   GREEN: implement deterministic shutdown. ACCEPT: no leaked Chronos futures or
   tasks under the test leak checks; memory never reports a fake disconnect.
 
-- [ ] **P1.8 — Extract and publish the reusable backend contract suite.** RED:
+- [x] **P1.8 — Extract and publish the reusable backend contract suite.** RED:
   prove a deliberately broken fake backend fails each important contract.
   GREEN: move portable KV/PubSub behavior into async factory-driven test
   helpers. ACCEPT: memory is tested only through the same harness Phase 2 will

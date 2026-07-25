@@ -47,5 +47,4 @@ task testOrc, "Run all tests with ORC":
 task testFile, "Run one test file; pass its path as the first argument":
   if commandLineParams().len == 0:
     quit "Usage: nimble testFile tests/tname.nim"
-  exec testCommand(testFile = commandLineParams()[0])
-
+  exec testCommand(testFile = commandLineParams()[^1])
