@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [devel]
+  pull_request:
+
+jobs:
+  memory:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [refc, orc]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.x"
+
+      - name: Install dependencies
+        run: nimble install -y --depsOnly
+
+      - name: Run tests
+        run: nim c --mm:${{ matrix.mm }} --path:src -d:test -r tests/tall.nim
+

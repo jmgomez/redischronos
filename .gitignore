@@ -1,0 +1,9 @@
+.DS_Store
+*.swp
+*~
+.env
+.env.local
+nimcache/
+tests/tall
+tests/tall.exe
+
