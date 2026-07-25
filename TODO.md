@@ -145,7 +145,7 @@ items merely because their design is complete.
   ACCEPT: no backend type checks, conditional imports, or changed call sites;
   only the URL differs.
 
-- [ ] **P2.11 — Stable release and deployment handoff.** Complete API review,
+- [x] **P2.11 — Stable release and deployment handoff.** Complete API review,
   README Redis examples, operational timeout/reconnect guidance, compatibility
   table, and changelog. Run refc/ORC memory+Redis suites from a clean clone,
   create an annotated stable tag, and record the commit. ACCEPT: the pinned
