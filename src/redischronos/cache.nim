@@ -56,11 +56,11 @@ proc acquirePhysicalKey(store: KvStore,
   try:
     await gate.lock.acquire()
     return gate
-  except CancelledError:
+  except CancelledError as error:
     dec gate.users
     if gate.users == 0 and physicalKeyGates.getOrDefault(identity) == gate:
       physicalKeyGates.del(identity)
-    raise
+    raise error
 
 proc releasePhysicalKey(store: KvStore, key: string,
     gate: PhysicalKeyGate) =
@@ -134,12 +134,12 @@ proc bumpVersionImpl(cache: Cache, key: string): Future[int64] {.async.} =
   cache.owned.add(incrementing)
   try:
     return await incrementing
-  except CancelledError:
-    raise
-  except CatchableError:
+  except CancelledError as error:
+    raise error
+  except CatchableError as error:
     if cache.options.failurePolicy == cfpFailOpen:
       return 0
-    raise
+    raise error
   finally:
     cache.owned.keepItIf(it != incrementing)
 
@@ -148,12 +148,12 @@ proc read(cache: Cache, key: string): Future[Option[string]] {.async.} =
   cache.owned.add(reading)
   try:
     return await reading
-  except CancelledError:
-    raise
-  except CatchableError:
+  except CancelledError as error:
+    raise error
+  except CatchableError as error:
     if cache.options.failurePolicy == cfpFailOpen:
       return none(string)
-    raise
+    raise error
   finally:
     cache.owned.keepItIf(it != reading)
 
@@ -182,7 +182,7 @@ proc fill(cache: Cache, key: string, loader: CacheLoader,
       cache.owned.add(writing)
       try:
         await writing
-      except CancelledError:
+      except CancelledError as error:
         if cache.closed or cache.generation != entry.cacheGeneration or
             cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
           let deleting = cache.store.delete(key)
@@ -192,10 +192,10 @@ proc fill(cache: Cache, key: string, loader: CacheLoader,
           finally:
             cache.owned.keepItIf(it != deleting)
           raise newException(BackendClosedError, "cache fill was fenced")
-        raise
-      except CatchableError:
+        raise error
+      except CatchableError as error:
         if cache.options.failurePolicy == cfpPropagate:
-          raise
+          raise error
       finally:
         cache.owned.keepItIf(it != writing)
       if cache.closed or cache.generation != entry.cacheGeneration or
@@ -210,11 +210,11 @@ proc fill(cache: Cache, key: string, loader: CacheLoader,
     finally:
       releasePhysicalKey(cache.store, key, gate)
     return value
-  except CancelledError:
+  except CancelledError as error:
     if cache.closed or cache.generation != entry.cacheGeneration or
         cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
       raise newException(BackendClosedError, "cache fill was fenced")
-    raise
+    raise error
   finally:
     if cache.fills.hasKey(key) and cache.fills[key] == entry:
       cache.fills.del(key)
@@ -257,10 +257,10 @@ proc getOrLoadImpl(cache: Cache, key: string,
   let cached =
     try:
       await cache.read(key)
-    except CancelledError:
+    except CancelledError as error:
       if cache.closed:
         raise newException(BackendClosedError, "cache is closed")
-      raise
+      raise error
   if cached.isSome:
     cache.requireOpen()
     return cached.get()
@@ -308,12 +308,12 @@ proc invalidateImpl(cache: Cache, key: string): Future[bool] {.async.} =
   cache.owned.add(deleting)
   try:
     return await deleting
-  except CancelledError:
-    raise
-  except CatchableError:
+  except CancelledError as error:
+    raise error
+  except CatchableError as error:
     if cache.options.failurePolicy == cfpFailOpen:
       return false
-    raise
+    raise error
   finally:
     cache.owned.keepItIf(it != deleting)
 

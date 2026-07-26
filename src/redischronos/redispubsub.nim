@@ -205,8 +205,8 @@ proc observeStates(bus: RedisPubSub) {.async.} =
       try:
         bus.stateHandlerTask = bus.currentStateHandler(state)
         await bus.stateHandlerTask
-      except CancelledError:
-        raise
+      except CancelledError as error:
+        raise error
       except CatchableError:
         discard
       finally:
@@ -227,8 +227,8 @@ proc deliver(subscription: RedisSubscription) {.async.} =
         subscription.handlerTask =
           subscription.handler(subscription.channel, payload)
         await subscription.handlerTask
-      except CancelledError:
-        raise
+      except CancelledError as error:
+        raise error
       except CatchableError:
         if subscription.owner.options.onHandlerError != nil:
           subscription.owner.options.onHandlerError(HandlerError(
@@ -415,8 +415,8 @@ proc reconnect(bus: RedisPubSub) {.async.} =
         await candidate.closeWait()
         bus.liveChannels.clear()
         raise error
-    except CancelledError:
-      raise
+    except CancelledError as error:
+      raise error
     except CatchableError:
       inc attempt
 
@@ -426,8 +426,8 @@ proc readerLoop(bus: RedisPubSub) {.async.} =
       let values = bus.parser.feed(await bus.subscriber.readSome())
       for value in values:
         bus.handleFrame(value)
-    except CancelledError:
-      raise
+    except CancelledError as error:
+      raise error
     except CatchableError as error:
       if bus.isClosed:
         return
@@ -581,7 +581,7 @@ method subscribe*(bus: RedisPubSub, channel: string,
       if bus.channels[channel].len == 0:
         bus.channels.del(channel)
       raise newException(BackendTimeoutError, "Redis subscribe timed out")
-    except CancelledError:
+    except CancelledError as error:
       if bus.subscribeAcks.hasKey(channel):
         bus.subscribeAcks.del(channel)
       subscription.active = false
@@ -592,8 +592,8 @@ method subscribe*(bus: RedisPubSub, channel: string,
         bus.channels.del(channel)
       if written and bus.subscriber != nil:
         bus.subscriber.close()
-      raise
-    except CatchableError:
+      raise error
+    except CatchableError as error:
       if bus.subscribeAcks.hasKey(channel):
         bus.subscribeAcks.del(channel)
       subscription.active = false
@@ -604,7 +604,7 @@ method subscribe*(bus: RedisPubSub, channel: string,
         bus.channels.del(channel)
       if bus.subscriber != nil:
         bus.subscriber.close()
-      raise
+      raise error
   return subscription
 
 method unsubscribe*(bus: RedisPubSub,
@@ -666,18 +666,18 @@ method unsubscribe*(bus: RedisPubSub,
       if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
         bus.unsubscribeAcks.del(redisSubscription.channel)
       raise newException(BackendTimeoutError, "Redis unsubscribe timed out")
-    except CancelledError:
+    except CancelledError as error:
       if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
         bus.unsubscribeAcks.del(redisSubscription.channel)
       if written and bus.subscriber != nil:
         bus.subscriber.close()
-      raise
-    except CatchableError:
+      raise error
+    except CatchableError as error:
       if bus.unsubscribeAcks.hasKey(redisSubscription.channel):
         bus.unsubscribeAcks.del(redisSubscription.channel)
       if bus.subscriber != nil:
         bus.subscriber.close()
-      raise
+      raise error
 
 method publish*(bus: RedisPubSub, channel,
     payload: string): Future[int64] {.async.} =

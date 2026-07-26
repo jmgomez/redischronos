@@ -77,8 +77,8 @@ proc deliver(subscription: MemorySubscription) {.async.} =
         subscription.handlerTask =
           subscription.handler(subscription.channel, payload)
         await subscription.handlerTask
-      except CancelledError:
-        raise
+      except CancelledError as error:
+        raise error
       except CatchableError:
         if subscription.owner.options.onHandlerError != nil:
           subscription.owner.options.onHandlerError(HandlerError(
@@ -105,8 +105,8 @@ proc observeStates(bus: InProcessPubSub) {.async.} =
       try:
         bus.stateHandlerTask = bus.currentStateHandler(state)
         await bus.stateHandlerTask
-      except CancelledError:
-        raise
+      except CancelledError as error:
+        raise error
       except CatchableError:
         discard
       finally:
