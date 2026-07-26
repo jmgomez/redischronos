@@ -406,15 +406,15 @@ proc reconnect(bus: RedisPubSub) {.async.} =
         bus.connected = true
         bus.notifyState(csConnected)
         return
-      except CancelledError:
+      except CancelledError as error:
         candidate.close()
         await candidate.closeWait()
-        raise
-      except CatchableError:
+        raise error
+      except CatchableError as error:
         candidate.close()
         await candidate.closeWait()
         bus.liveChannels.clear()
-        raise
+        raise error
     except CancelledError:
       raise
     except CatchableError:
