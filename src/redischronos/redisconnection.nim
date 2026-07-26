@@ -102,9 +102,9 @@ proc establish(connection: RedisConnection, deadline: Moment) {.async.} =
       break
     except AsyncTimeoutError:
       await connectFuture.cancelAndWait()
-    except CancelledError:
+    except CancelledError as error:
       await connectFuture.cancelAndWait()
-      raise
+      raise error
     except TransportError:
       discard
   if connection.transport == nil:
@@ -130,9 +130,9 @@ proc establish(connection: RedisConnection, deadline: Moment) {.async.} =
         "OK"
       )
     checkHandshakeReply(await connection.sendRaw(["PING"]), "PONG")
-  except CatchableError:
+  except CatchableError as error:
     await connection.disconnect()
-    raise
+    raise error
 
 proc executeImpl(connection: RedisConnection,
     arguments: seq[string]): Future[RespValue] {.async.} =
@@ -181,19 +181,19 @@ proc executeImpl(connection: RedisConnection,
       raise newException(BackendTimeoutError, "Redis operation timed out")
     if result.kind == rkError:
       raise newException(RedisCommandError, "Redis command failed")
-  except CancelledError:
+  except CancelledError as error:
     if acquired:
       await connection.disconnect()
-    raise
+    raise error
   except TransportError:
     await connection.disconnect()
     raise newException(BackendConnectionError, "Redis connection failed")
-  except BackendConnectionError:
+  except BackendConnectionError as error:
     await connection.disconnect()
-    raise
-  except ProtocolError:
+    raise error
+  except ProtocolError as error:
     await connection.disconnect()
-    raise
+    raise error
   finally:
     if acquired:
       connection.lock.release()

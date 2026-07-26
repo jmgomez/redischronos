@@ -150,9 +150,9 @@ proc connectSubscriber(config: RedisConfig,
       break
     except AsyncTimeoutError:
       await connecting.cancelAndWait()
-    except CancelledError:
+    except CancelledError as error:
       await connecting.cancelAndWait()
-      raise
+      raise error
     except TransportError:
       discard
   if transport == nil:
@@ -193,9 +193,9 @@ proc connectSubscriber(config: RedisConfig,
       ),
       "PONG"
     )
-  except CatchableError:
+  except CatchableError as error:
     await transport.closeWait()
-    raise
+    raise error
   return (transport, parser)
 
 proc observeStates(bus: RedisPubSub) {.async.} =
@@ -508,11 +508,11 @@ proc writeSubscriberImpl(bus: RedisPubSub,
         BackendTimeoutError,
         "Redis subscriber write timed out"
       )
-    except CancelledError:
+    except CancelledError as error:
       await writing.cancelAndWait()
       if bus.subscriber != nil:
         bus.subscriber.close()
-      raise
+      raise error
   finally:
     if acquired:
       bus.writeLock.release()
