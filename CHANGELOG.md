@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.4 — 2026-07-26
+
+- Restore the published annotated tag object after GitHub checkout before
+  verifying and attesting release archives.
+
 ## 1.1.3 — 2026-07-26
 
 - Serialize cache compensation across cache instances sharing one store and

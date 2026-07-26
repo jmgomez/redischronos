@@ -83,7 +83,9 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
           test "$(git cat-file -t "refs/tags/${tag}")" = tag
+          test "$(git rev-list -n 1 "${tag}")" = "${GITHUB_SHA}"
           grep -Fx "version       = \"${version}\"" redischronos.nimble
           grep -Fx "const redischronosVersion* = \"${version}\"" src/redischronos.nim
           git archive --format=tar.gz --prefix="redischronos-${version}/" \
