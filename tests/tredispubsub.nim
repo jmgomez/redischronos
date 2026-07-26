@@ -281,6 +281,36 @@ when defined(redisIntegration):
         check bus.closeCallerCountForTest() == 0
       waitFor exercise()
 
+    test "external close still joins a held terminal observer":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let terminalStarted =
+          newFuture[void]("Redis terminal observer started")
+        let terminalRelease =
+          newFuture[void]("Redis terminal observer release")
+        var states: seq[ConnectionState]
+        bus.onStateChange(
+          proc(state: ConnectionState): Future[void] {.async.} =
+            states.add(state)
+            if state == csClosed:
+              terminalStarted.complete()
+              await terminalRelease
+            await sleepAsync(0.milliseconds)
+            await bus.close()
+        )
+        let firstExternal = bus.close()
+        await terminalStarted.wait(200.milliseconds)
+        let secondExternal = bus.close()
+        await sleepAsync(5.milliseconds)
+        check not firstExternal.finished
+        check not secondExternal.finished
+        terminalRelease.complete()
+        await firstExternal.wait(200.milliseconds)
+        await secondExternal.wait(200.milliseconds)
+        check states == @[csConnected, csClosed]
+        check bus.closeCallerCountForTest() == 0
+      waitFor exercise()
+
     test "bounded queues and retiring workers remain owned through close":
       proc exercise() {.async.} =
         var options = defaultBackendOptions()

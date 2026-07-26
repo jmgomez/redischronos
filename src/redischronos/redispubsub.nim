@@ -43,7 +43,6 @@ type
     stateQueue: Deque[ConnectionState]
     stateWorker: Future[void]
     stateHandlerTask: Future[void]
-    terminalObserverActive: bool
     rng: Rand
     closeTask: Future[void]
     closeCallers: seq[Future[void]]
@@ -204,7 +203,6 @@ proc observeStates(bus: RedisPubSub) {.async.} =
     let state = bus.stateQueue.popFirst()
     if bus.currentStateHandler != nil:
       try:
-        bus.terminalObserverActive = state == csClosed
         bus.stateHandlerTask = bus.currentStateHandler(state)
         await bus.stateHandlerTask
       except CancelledError:
@@ -213,7 +211,6 @@ proc observeStates(bus: RedisPubSub) {.async.} =
         discard
       finally:
         bus.stateHandlerTask = nil
-        bus.terminalObserverActive = false
 
 proc notifyState(bus: RedisPubSub, state: ConnectionState) =
   bus.stateQueue.addLast(state)
@@ -739,15 +736,15 @@ proc closeOwned(bus: RedisPubSub) {.async.} =
   await bus.publishConnection.close()
   bus.notifyState(csClosed)
   if bus.stateWorker != nil and not bus.stateWorker.finished:
-    let caller = bus.activeCloseCaller(bus.stateHandlerTask)
-    if caller != nil:
-      caller.complete()
-      await bus.stateWorker
-    else:
-      try:
-        await bus.stateWorker.wait(bus.options.operationTimeout)
-      except AsyncTimeoutError:
-        await bus.stateWorker.cancelAndWait()
+    let observerDeadline = Moment.now() + bus.options.operationTimeout
+    while not bus.stateWorker.finished and Moment.now() < observerDeadline:
+      let caller = bus.activeCloseCaller(bus.stateHandlerTask)
+      if caller != nil:
+        caller.complete()
+      if not bus.stateWorker.finished:
+        await sleepAsync(0.milliseconds)
+    if not bus.stateWorker.finished:
+      await bus.stateWorker.cancelAndWait()
   bus.channels.clear()
   bus.subscriptions.setLen(0)
   bus.retiring.setLen(0)
@@ -762,10 +759,6 @@ proc ensureClose(bus: RedisPubSub) =
 
 method close*(bus: RedisPubSub): Future[void] =
   bus.ensureClose()
-  if bus.terminalObserverActive:
-    let handedOff = newFuture[void]("Redis terminal observer close handoff")
-    handedOff.complete()
-    return handedOff
   let caller = newFuture[void](
     "Redis Pub/Sub close caller",
     {FutureFlag.OwnCancelSchedule}
