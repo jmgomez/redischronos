@@ -190,8 +190,9 @@ waitFor main()
 
 Concurrent misses for one key share a loader. `CacheOptions` controls TTL,
 backend fail-open behavior, and whether a loader with no remaining waiters is
-cancelled. Invalidation, version bumps, and close fence older fills before
-they can write. In fail-open mode, read/write failures fall back to the loader,
+cancelled. Invalidation, version bumps, and close fence older fills; a backend
+write that resists cancellation is joined and removed before close completes.
+In fail-open mode, read/write failures fall back to the loader,
 failed invalidation returns `false`, and a failed version increment returns
 `0`; cancellation is always propagated. The injected `KvStore` remains
 caller-owned.

@@ -195,3 +195,49 @@ suite "memory Pub/Sub internals":
       await returned.wait(100.milliseconds)
       await bus.close()
     waitFor exercise()
+
+  test "message and state callback helpers can concurrently await close":
+    proc exercise() {.async.} =
+      let bus = await openPubSub()
+      let release = newFuture[void]("release callback close helpers")
+      let bothStarted = newFuture[void]("both close callbacks started")
+      let bothReturned = newFuture[void]("both close callbacks returned")
+      var started, returned: int
+      proc closeViaHelper() {.async.} =
+        await sleepAsync(1.milliseconds)
+        await bus.close()
+      proc runClose() {.async.} =
+        inc started
+        if started == 2:
+          bothStarted.complete()
+        await release
+        await closeViaHelper()
+        inc returned
+        if returned == 2:
+          bothReturned.complete()
+      bus.onStateChange(
+        proc(state: ConnectionState): Future[void] {.async.} =
+          if state == csConnected:
+            await runClose()
+      )
+      discard await bus.subscribe(
+        "concurrent-close",
+        proc(channel, payload: string): Future[void] {.async.} =
+          await runClose()
+      )
+      discard await bus.publish("concurrent-close", "payload")
+      await bothStarted.wait(100.milliseconds)
+      release.complete()
+      await bothReturned.wait(100.milliseconds)
+      await bus.close().wait(100.milliseconds)
+      check bus.closeCallerCountForTest() == 0
+    waitFor exercise()
+
+  test "terminal close calls retain no caller ancestry":
+    proc exercise() {.async.} =
+      let bus = await openPubSub()
+      await bus.close()
+      for _ in 0 ..< 10_000:
+        await bus.close()
+      check bus.closeCallerCountForTest() == 0
+    waitFor exercise()

@@ -8,6 +8,7 @@ import ./tcontractharness
 import ./tcache
 import ./tresp2
 import ./tredisurl
+import ./tredisresolve
 import ./tredisconnection
 import ./trediskv
 import ./tredispubsub
@@ -16,7 +17,7 @@ import ./tredisoutage
 
 suite "public contracts":
   test "exposes the stable release version":
-    check redischronosVersion == "1.1.1"
+    check redischronosVersion == "1.1.2"
 
   test "default options match the documented contract":
     let options = defaultBackendOptions()

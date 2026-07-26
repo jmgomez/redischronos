@@ -49,6 +49,24 @@ proc requireChannel(channel: string) =
   if channel.len == 0:
     raise newException(InvalidArgumentError, "channel must not be empty")
 
+proc containsFuture(root, target: FutureBase): bool =
+  var current = root
+  var depth = 0
+  while current != nil and depth < 1024:
+    if current == target:
+      return true
+    current = current.internalChild
+    inc depth
+
+proc activeCloseCaller(bus: InProcessPubSub,
+    root: FutureBase): Future[void] =
+  for caller in bus.closeCallers:
+    if not caller.finished and containsFuture(root, caller):
+      return caller
+
+proc removeCloseCaller(bus: InProcessPubSub, caller: Future[void]) =
+  bus.closeCallers.keepItIf(it != caller)
+
 proc deliver(subscription: MemorySubscription) {.async.} =
   try:
     while subscription.active and subscription.queue.len > 0:
@@ -168,22 +186,20 @@ proc closeOwned(bus: InProcessPubSub) {.async.} =
   let owned = bus.subscriptions & bus.retiring
   for subscription in owned:
     if subscription.worker != nil and not subscription.worker.finished:
-      var callbackClosing = false
-      if subscription.handlerTask != nil:
-        for caller in bus.closeCallers:
-          if subscription.handlerTask.internalChild == caller:
-            callbackClosing = true
-      if not callbackClosing:
+      let caller = bus.activeCloseCaller(subscription.handlerTask)
+      if caller != nil:
+        caller.complete()
+        await subscription.worker
+      else:
         await subscription.worker.cancelAndWait()
   if bus.currentStateHandler != nil:
     bus.notifyState(csClosed)
   if bus.stateWorker != nil and not bus.stateWorker.finished:
-    var callbackClosing = false
-    if bus.stateHandlerTask != nil:
-      for caller in bus.closeCallers:
-        if bus.stateHandlerTask.internalChild == caller:
-          callbackClosing = true
-    if not callbackClosing:
+    let caller = bus.activeCloseCaller(bus.stateHandlerTask)
+    if caller != nil:
+      caller.complete()
+      await bus.stateWorker
+    else:
       try:
         await bus.stateWorker.wait(bus.options.operationTimeout)
       except AsyncTimeoutError:
@@ -194,15 +210,32 @@ proc closeOwned(bus: InProcessPubSub) {.async.} =
   bus.stateQueue.clear()
   bus.currentStateHandler = nil
 
-proc joinClose(bus: InProcessPubSub): Future[void] {.async.} =
+proc ensureClose(bus: InProcessPubSub) =
   if bus.closeTask == nil:
     bus.isClosed = true
     bus.closeTask = bus.closeOwned()
-  await bus.closeTask.noCancel()
 
 method close*(bus: InProcessPubSub): Future[void] =
-  result = bus.joinClose()
-  bus.closeCallers.add(result)
+  bus.ensureClose()
+  let caller = newFuture[void](
+    "memory Pub/Sub close caller",
+    {FutureFlag.OwnCancelSchedule}
+  )
+  caller.cancelCallback = nil
+  bus.closeCallers.add(caller)
+  proc finishCaller(_: pointer) {.gcsafe, raises: [].} =
+    if not caller.finished:
+      if bus.closeTask.failed:
+        caller.fail(bus.closeTask.error)
+      elif bus.closeTask.cancelled:
+        caller.cancelSoon()
+      else:
+        caller.complete()
+  proc pruneCaller(_: pointer) {.gcsafe, raises: [].} =
+    bus.removeCloseCaller(caller)
+  bus.closeTask.addCallback(finishCaller, nil)
+  caller.addCallback(pruneCaller, nil)
+  result = caller
 
 when defined(test):
   proc deliveryStateCountsForTest*(bus: PubSub): (int, int, int) =
@@ -212,3 +245,6 @@ when defined(test):
       memoryBus.subscriptions.len,
       memoryBus.retiring.len
     )
+
+  proc closeCallerCountForTest*(bus: PubSub): int =
+    InProcessPubSub(bus).closeCallers.len

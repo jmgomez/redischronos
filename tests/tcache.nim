@@ -1,4 +1,4 @@
-import std/[options, os, times, unittest]
+import std/[options, os, tables, times, unittest]
 import chronos
 
 import redischronos
@@ -11,6 +11,12 @@ type
   BlockingReadStore = ref object of KvStore
     started: Future[void]
     release: Future[void]
+  LateWriteStore = ref object of KvStore
+    values: Table[string, string]
+    writeStarted: Future[void]
+    writeRelease: Future[void]
+  CancelledStore = ref object of KvStore
+  CancelledWriteStore = ref object of KvStore
 
 method get(store: FailingStore,
     key: string): Future[Option[string]] {.async.} =
@@ -39,6 +45,47 @@ method get(store: BlockingReadStore,
   store.started.complete()
   await store.release.noCancel()
   return none(string)
+
+method get(store: LateWriteStore,
+    key: string): Future[Option[string]] {.async.} =
+  if store.values.hasKey(key):
+    return some(store.values[key])
+  return none(string)
+
+method set(store: LateWriteStore, key, value: string,
+    ttlSeconds = 0): Future[void] {.async.} =
+  store.writeStarted.complete()
+  await store.writeRelease.noCancel()
+  store.values[key] = value
+
+method delete(store: LateWriteStore, key: string): Future[bool] {.async.} =
+  result = store.values.hasKey(key)
+  store.values.del(key)
+
+method increment(store: LateWriteStore, key: string): Future[int64] {.async.} =
+  return 1
+
+method get(store: CancelledStore,
+    key: string): Future[Option[string]] {.async.} =
+  raise newException(CancelledError, "injected read cancellation")
+
+method set(store: CancelledStore, key, value: string,
+    ttlSeconds = 0): Future[void] {.async.} =
+  raise newException(CancelledError, "injected write cancellation")
+
+method delete(store: CancelledStore, key: string): Future[bool] {.async.} =
+  raise newException(CancelledError, "injected delete cancellation")
+
+method increment(store: CancelledStore, key: string): Future[int64] {.async.} =
+  raise newException(CancelledError, "injected increment cancellation")
+
+method get(store: CancelledWriteStore,
+    key: string): Future[Option[string]] {.async.} =
+  return none(string)
+
+method set(store: CancelledWriteStore, key, value: string,
+    ttlSeconds = 0): Future[void] {.async.} =
+  raise newException(CancelledError, "injected write cancellation")
 
 proc runCacheContract(name: string, factory: StoreFactory) =
   let prefix =
@@ -107,6 +154,7 @@ proc runCacheContract(name: string, factory: StoreFactory) =
         release.complete()
         check (await survivor) == "shared"
         check loads == 1
+        discard await store.delete(prefix & "shared")
         await cache.close()
         await store.close()
       waitFor exercise()
@@ -265,6 +313,38 @@ suite "cache failure policy":
       await lenient.close()
     waitFor exercise()
 
+  test "strict invalidation and version failures retain their typed errors":
+    proc exercise() {.async.} =
+      let strict = newCache(FailingStore())
+      expect BackendConnectionError:
+        discard await strict.invalidate("key")
+      expect BackendTimeoutError:
+        discard await strict.bumpVersion("version")
+      await strict.close()
+    waitFor exercise()
+
+  test "fail-open never swallows backend cancellation":
+    proc exercise() {.async.} =
+      var options = defaultCacheOptions()
+      options.failurePolicy = cfpFailOpen
+      let cache = newCache(CancelledStore(), options)
+      let loader: CacheLoader =
+        proc(key: string): Future[string] {.async.} =
+          return "fallback"
+      expect CancelledError:
+        discard await cache.getOrLoad("read", loader)
+      expect CancelledError:
+        discard await cache.invalidate("delete")
+      expect CancelledError:
+        discard await cache.bumpVersion("increment")
+      await cache.close()
+
+      let writeCache = newCache(CancelledWriteStore(), options)
+      expect CancelledError:
+        discard await writeCache.getOrLoad("write", loader)
+      await writeCache.close()
+    waitFor exercise()
+
 suite "cache fencing and ownership":
   test "invalidation fences a cancellation-resistant active fill":
     proc exercise() {.async.} =
@@ -329,6 +409,65 @@ suite "cache fencing and ownership":
       check (await cache.getOrLoad("recursive", normal)) == "recovered"
       await cache.close()
       await store.close()
+    waitFor exercise()
+
+  test "same-key reentrant loader after a yield fails deterministically":
+    proc exercise() {.async.} =
+      let store = await openKvStore("mem://")
+      let cache = newCache(store)
+      var recursive: CacheLoader
+      recursive =
+        proc(key: string): Future[string] {.async.} =
+          await sleepAsync(chronos.milliseconds(0))
+          return await cache.getOrLoad(key, recursive)
+      expect InvalidArgumentError:
+        discard await cache.getOrLoad("delayed-recursive", recursive)
+      await cache.close()
+      await store.close()
+    waitFor exercise()
+
+  test "a loader can initiate close without deadlocking cleanup":
+    proc exercise() {.async.} =
+      let store = await openKvStore("mem://")
+      let cache = newCache(store)
+      let closeReturned = newFuture[void]("loader close returned")
+      let loader: CacheLoader =
+        proc(key: string): Future[string] {.async.} =
+          await sleepAsync(chronos.milliseconds(0))
+          await cache.close()
+          closeReturned.complete()
+          return "fenced"
+      let filling = cache.getOrLoad("loader-close", loader)
+      await closeReturned.wait(chronos.milliseconds(100))
+      expect BackendClosedError:
+        discard await filling
+      await cache.close().wait(chronos.milliseconds(100))
+      check (await store.get("loader-close")).isNone
+      await store.close()
+    waitFor exercise()
+
+  test "close compensates a cancellation-resistant backend write":
+    proc exercise() {.async.} =
+      let writeStarted = newFuture[void]("late cache write started")
+      let writeRelease = newFuture[void]("late cache write release")
+      let store = LateWriteStore(
+        values: initTable[string, string](),
+        writeStarted: writeStarted,
+        writeRelease: writeRelease
+      )
+      let cache = newCache(store)
+      let loader: CacheLoader =
+        proc(key: string): Future[string] {.async.} =
+          return "committed-after-close"
+      let filling = cache.getOrLoad("late-write", loader)
+      await writeStarted
+      let closing = cache.close()
+      await sleepAsync(chronos.milliseconds(0))
+      writeRelease.complete()
+      await closing.wait(chronos.milliseconds(100))
+      expect BackendClosedError:
+        discard await filling
+      check (await store.get("late-write")).isNone
     waitFor exercise()
 
   test "cancelled orphan is fenced before an immediate replacement":

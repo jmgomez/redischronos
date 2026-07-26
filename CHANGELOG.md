@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.2 — 2026-07-26
+
+- Make cache shutdown translate internal cancellation, detect yielded
+  recursion, hand off loader-initiated close safely, and compensate backend
+  writes that cross a close fence.
+- Make callback-initiated Pub/Sub close follow arbitrary async helper ancestry
+  while pruning all completed caller tracking.
+- Replace deprecated unbounded threadpool DNS work with one bounded resolver
+  worker and bounded request/result queues per event-loop thread.
+- Expand lifecycle, failure-policy, resolver stress, cleanup, and release
+  evidence.
+
 ## 1.1.1 — 2026-07-25
 
 - Fence cache fills against invalidation, version changes, orphan replacement,

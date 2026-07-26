@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [devel]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -66,3 +67,41 @@ jobs:
 
       - name: Verify Redis was restored by the outage contract
         run: timeout 30s sh -c 'until docker exec "${{ job.services.redis.id }}" redis-cli -a audit-password ping 2>/dev/null | grep -q PONG; do sleep 1; done'
+
+  release-attestation:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify annotated tag, version, and audited archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          test "$(git cat-file -t "refs/tags/${tag}")" = tag
+          grep -Fx "version       = \"${version}\"" redischronos.nimble
+          grep -Fx "const redischronosVersion* = \"${version}\"" src/redischronos.nim
+          git archive --format=tar.gz --prefix="redischronos-${version}/" \
+            -o "redischronos-${version}.tar.gz" "${tag}"
+          tar -tzf "redischronos-${version}.tar.gz" \
+            | grep -Fx "redischronos-${version}/src/redischronos/cache.nim"
+          tar -tzf "redischronos-${version}.tar.gz" \
+            | grep -Fx "redischronos-${version}/src/redischronos/redisresolve.nim"
+          {
+            echo "tag=${tag}"
+            echo "commit=$(git rev-list -n 1 "${tag}")"
+            shasum -a 256 "redischronos-${version}.tar.gz"
+          } > "redischronos-${version}.attestation.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redischronos-${{ github.ref_name }}
+          path: |
+            redischronos-*.tar.gz
+            redischronos-*.attestation.txt
+          if-no-files-found: error

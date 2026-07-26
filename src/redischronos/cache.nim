@@ -34,6 +34,7 @@ type
     keyGenerations: Table[string, uint64]
     owned: seq[FutureBase]
     activeOperations: int
+    closeCallers: seq[Future[void]]
 
 func defaultCacheOptions*(): CacheOptions =
   CacheOptions(
@@ -58,6 +59,23 @@ proc newCache*(store: KvStore,
 proc requireOpen(cache: Cache) =
   if cache.closed:
     raise newException(BackendClosedError, "cache is closed")
+
+proc containsFuture(root, target: FutureBase): bool =
+  var current = root
+  var depth = 0
+  while current != nil and depth < 1024:
+    if current == target:
+      return true
+    current = current.internalChild
+    inc depth
+
+proc activeCloseCaller(cache: Cache, root: FutureBase): Future[void] =
+  for caller in cache.closeCallers:
+    if not caller.finished and containsFuture(root, caller):
+      return caller
+
+proc removeCloseCaller(cache: Cache, caller: Future[void]) =
+  cache.closeCallers.keepItIf(it != caller)
 
 proc versionedKey*(key: string, version: int64): string =
   if key.len == 0:
@@ -137,14 +155,34 @@ proc fill(cache: Cache, key: string, loader: CacheLoader,
       cache.owned.keepItIf(it != writing)
     if cache.closed or cache.generation != entry.cacheGeneration or
         cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
+      let deleting = cache.store.delete(key)
+      cache.owned.add(deleting)
+      try:
+        discard await deleting
+      finally:
+        cache.owned.keepItIf(it != deleting)
       raise newException(BackendClosedError, "cache fill was fenced")
     return value
+  except CancelledError:
+    if cache.closed or cache.generation != entry.cacheGeneration or
+        cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
+      let deleting = cache.store.delete(key)
+      cache.owned.add(deleting)
+      try:
+        discard await deleting
+      finally:
+        cache.owned.keepItIf(it != deleting)
+      raise newException(BackendClosedError, "cache fill was fenced")
+    raise
   finally:
     if cache.fills.hasKey(key) and cache.fills[key] == entry:
       cache.fills.del(key)
 
 proc getOrLoadImpl(cache: Cache, key: string,
     loader: CacheLoader): Future[string] {.async.} =
+  # Let the caller publish this future into its await chain before checking
+  # whether the call originated from the loader that owns the same fill.
+  await sleepAsync(0.milliseconds)
   cache.requireOpen()
   if key.len == 0:
     raise newException(InvalidArgumentError, "cache key must not be empty")
@@ -153,7 +191,8 @@ proc getOrLoadImpl(cache: Cache, key: string,
 
   if cache.fills.hasKey(key):
     let existing = cache.fills[key]
-    if existing.invokingLoader:
+    if existing.invokingLoader or
+        containsFuture(existing.task, chronosInternalRetFuture):
       raise newException(
         InvalidArgumentError,
         "cache loader must not recursively load its own key"
@@ -174,7 +213,13 @@ proc getOrLoadImpl(cache: Cache, key: string,
             cache.fills.del(key)
           existing.task.cancelSoon()
 
-  let cached = await cache.read(key)
+  let cached =
+    try:
+      await cache.read(key)
+    except CancelledError:
+      if cache.closed:
+        raise newException(BackendClosedError, "cache is closed")
+      raise
   if cached.isSome:
     cache.requireOpen()
     return cached.get()
@@ -232,15 +277,26 @@ proc invalidateImpl(cache: Cache, key: string): Future[bool] {.async.} =
     cache.owned.keepItIf(it != deleting)
 
 proc closeOwned(cache: Cache): Future[void] {.async.} =
+  # Let callback/loader callers attach the returned close future before
+  # inspecting owned-task ancestry.
+  await sleepAsync(0.milliseconds)
   inc cache.generation
   var tasks: seq[FutureBase]
   for _, entry in cache.fills.pairs:
     if entry.task != nil and not entry.task.finished:
-      entry.task.cancelSoon()
+      let caller = cache.activeCloseCaller(entry.task)
+      if caller != nil:
+        caller.complete()
+      else:
+        entry.task.cancelSoon()
       tasks.add(entry.task)
   for operation in cache.owned:
     if not operation.finished:
-      operation.cancelSoon()
+      let caller = cache.activeCloseCaller(operation)
+      if caller != nil:
+        caller.complete()
+      else:
+        operation.cancelSoon()
       tasks.add(operation)
   if tasks.len > 0:
     await allFutures(tasks)
@@ -250,14 +306,32 @@ proc closeOwned(cache: Cache): Future[void] {.async.} =
   cache.owned.setLen(0)
   cache.keyGenerations.clear()
 
-proc joinClose(cache: Cache): Future[void] {.async.} =
+proc ensureClose(cache: Cache) =
   if cache.closeTask == nil:
     cache.closed = true
     cache.closeTask = cache.closeOwned()
-  await cache.closeTask.noCancel()
 
 proc close*(cache: Cache): Future[void] =
-  cache.joinClose()
+  cache.ensureClose()
+  let caller = newFuture[void](
+    "cache close caller",
+    {FutureFlag.OwnCancelSchedule}
+  )
+  caller.cancelCallback = nil
+  cache.closeCallers.add(caller)
+  proc finishCaller(_: pointer) {.gcsafe, raises: [].} =
+    if not caller.finished:
+      if cache.closeTask.failed:
+        caller.fail(cache.closeTask.error)
+      elif cache.closeTask.cancelled:
+        caller.cancelSoon()
+      else:
+        caller.complete()
+  proc pruneCaller(_: pointer) {.gcsafe, raises: [].} =
+    cache.removeCloseCaller(caller)
+  cache.closeTask.addCallback(finishCaller, nil)
+  caller.addCallback(pruneCaller, nil)
+  result = caller
 
 proc getOrLoad*(cache: Cache, key: string,
     loader: CacheLoader): Future[string] {.async.} =

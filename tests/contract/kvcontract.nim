@@ -1,28 +1,44 @@
-import std/[options, unittest]
+import std/[options, os, unittest]
 import chronos
 import redischronos
 
 type KvFactory* = proc(): Future[KvStore] {.gcsafe.}
 
+var kvProbeCounter: uint64
+
 proc probeKvContract*(factory: KvFactory): Future[seq[string]] {.async.} =
   let store = await factory()
-  if (await store.get("missing")).isSome:
+  inc kvProbeCounter
+  let prefix = "redischronos:probe:" & $getCurrentProcessId() & ":" &
+    $kvProbeCounter & ":"
+  let missing = prefix & "missing"
+  let roundTrip = prefix & "roundtrip"
+  let counter = prefix & "counter"
+  let expiring = prefix & "expiring"
+  let expiringCounter = prefix & "expiring-counter"
+  if (await store.get(missing)).isSome:
     result.add("missing get")
-  await store.set("roundtrip", "before\0after\xFF")
-  if (await store.get("roundtrip")) != some("before\0after\xFF"):
+  await store.set(roundTrip, "before\0after\xFF")
+  if (await store.get(roundTrip)) != some("before\0after\xFF"):
     result.add("round trip")
   try:
-    if not (await store.exists("roundtrip")):
+    if not (await store.exists(roundTrip)):
       result.add("exists")
   except CatchableError:
     result.add("exists")
-  if not (await store.delete("roundtrip")):
-    result.add("delete")
-  if (await store.increment("counter")) != 1:
-    result.add("increment")
-  await store.set("roundtrip", "overwritten")
-  if (await store.get("roundtrip")) != some("overwritten"):
+  if not (await store.delete(roundTrip)):
+    result.add("delete existing")
+  if await store.delete(prefix & "missing-delete"):
+    result.add("delete missing")
+  if (await store.increment(counter)) != 1:
+    result.add("increment missing")
+  await store.set(roundTrip, "first")
+  await store.set(roundTrip, "overwritten")
+  if (await store.get(roundTrip)) != some("overwritten"):
     result.add("overwrite")
+  await store.set(roundTrip, "")
+  if (await store.get(roundTrip)) != some(""):
+    result.add("empty value")
   try:
     discard await store.get("")
     result.add("invalid key")
@@ -31,17 +47,65 @@ proc probeKvContract*(factory: KvFactory): Future[seq[string]] {.async.} =
   except CatchableError:
     result.add("invalid key")
   try:
-    await store.set("roundtrip", "invalid ttl", -1)
+    await store.set(roundTrip, "invalid ttl", -1)
     result.add("negative ttl")
   except InvalidArgumentError:
     discard
   except CatchableError:
     result.add("negative ttl")
-  discard await store.delete("roundtrip")
-  discard await store.delete("counter")
+  var increments: seq[Future[int64]]
+  for _ in 0 ..< 20:
+    increments.add(store.increment(counter))
+  for increment in increments:
+    discard await increment
+  if (await store.get(counter)) != some("21"):
+    result.add("atomic increment")
+  for value in ["invalid", $high(int64)]:
+    await store.set(counter, value)
+    try:
+      discard await store.increment(counter)
+      result.add(
+        if value == "invalid": "invalid increment" else: "overflow increment"
+      )
+    except RedisCommandError:
+      discard
+    except CatchableError:
+      result.add(
+        if value == "invalid": "invalid increment" else: "overflow increment"
+      )
+    if (await store.get(counter)) != some(value):
+      result.add(
+        if value == "invalid":
+          "invalid value preservation"
+        else:
+          "overflow value preservation"
+      )
+  await store.set(expiring, "value", 1)
+  await store.set(expiringCounter, "1", 1)
+  try:
+    if (await store.increment(expiringCounter)) != 2:
+      result.add("TTL increment")
+  except CatchableError:
+    result.add("TTL increment")
+  let expiryDeadline = Moment.now() + chronos.seconds(2)
+  while Moment.now() < expiryDeadline:
+    if (await store.get(expiring)).isNone and
+        (await store.get(expiringCounter)).isNone:
+      break
+    await sleepAsync(chronos.milliseconds(10))
+  if (await store.get(expiring)).isSome:
+    result.add("TTL expiry")
+  if (await store.get(expiringCounter)).isSome:
+    result.add("increment TTL preservation")
+  for key in [roundTrip, counter, expiring, expiringCounter]:
+    discard await store.delete(key)
   await store.close()
   try:
-    discard await store.get("closed")
+    await store.close()
+  except CatchableError:
+    result.add("idempotent close")
+  try:
+    discard await store.get(prefix & "closed")
     result.add("closed lifecycle")
   except BackendClosedError:
     discard

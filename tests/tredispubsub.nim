@@ -218,6 +218,54 @@ when defined(redisIntegration):
         await bus.close()
       waitFor exercise()
 
+    test "message and state callback helpers concurrently await close":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        let release = newFuture[void]("release Redis close helpers")
+        let bothStarted = newFuture[void]("both Redis callbacks started")
+        let bothReturned = newFuture[void]("both Redis callbacks returned")
+        var started, returned: int
+        proc closeViaHelper() {.async.} =
+          await sleepAsync(1.milliseconds)
+          await bus.close()
+        proc runClose() {.async.} =
+          inc started
+          if started == 2:
+            bothStarted.complete()
+          await release
+          await closeViaHelper()
+          inc returned
+          if returned == 2:
+            bothReturned.complete()
+        bus.onStateChange(
+          proc(state: ConnectionState): Future[void] {.async.} =
+            if state == csConnected:
+              await runClose()
+        )
+        discard await bus.subscribe(
+          "redischronos:concurrent-close",
+          proc(channel, payload: string): Future[void] {.async.} =
+            await runClose()
+        )
+        discard await bus.publish(
+          "redischronos:concurrent-close", "payload"
+        )
+        await bothStarted.wait(200.milliseconds)
+        release.complete()
+        await bothReturned.wait(200.milliseconds)
+        await bus.close().wait(200.milliseconds)
+        check bus.closeCallerCountForTest() == 0
+      waitFor exercise()
+
+    test "terminal close calls retain no caller ancestry":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        await bus.close()
+        for _ in 0 ..< 10_000:
+          await bus.close()
+        check bus.closeCallerCountForTest() == 0
+      waitFor exercise()
+
     test "bounded queues and retiring workers remain owned through close":
       proc exercise() {.async.} =
         var options = defaultBackendOptions()

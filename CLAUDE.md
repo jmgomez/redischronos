@@ -22,12 +22,13 @@ Consumers must not change imports or call sites when switching backends.
 ## Architecture boundaries
 
 - The library owns mechanisms: key/value operations, TTL, bounded in-memory
-  storage, atomic counters, pub/sub transport, RESP2, deadlines, and
-  connection lifecycle.
-- Consumers own policies: key naming, serialization, cache invalidation,
-  fail-open/fail-closed behavior, and domain event schemas.
-- Keep the public API small. Do not add cache frameworks, ORM integrations,
-  distributed locks, queues, or application-specific helpers.
+  storage, atomic counters, pub/sub transport, RESP2, deadlines, connection
+  lifecycle, and the opt-in generic cache layered on an injected `KvStore`.
+- Consumers own policies: domain key naming, serialization, when and what to
+  invalidate, cache failure/cancellation option selection, and domain event
+  schemas.
+- Keep the public API small. Do not add domain cache frameworks, ORM
+  integrations, distributed locks, queues, or application-specific helpers.
 - The in-memory backend is local to one process and one Chronos event loop.
   Cross-thread use is out of contract.
 - `RedisKvStore` owns one serialized command connection. `RedisPubSub` owns

@@ -30,8 +30,9 @@ setting a URL. It must not require library or application code changes.
    same parameterized contract suite.
 2. **Memory first, not memory-only architecture.** Phase 1 is immediately
    useful, but all seams are deliberately compatible with Phase 2.
-3. **Mechanisms, not policies.** The library supplies storage and transport;
-   consumers decide key schemas, serialization, invalidation, and degradation.
+3. **Mechanisms, not policies.** The library supplies storage, transport, and
+   an opt-in generic cache over an injected `KvStore`; consumers decide domain
+   key schemas, serialization, invalidation decisions, and degradation policy.
 4. **Small surface.** Prefer five KV operations and four Pub/Sub lifecycle
    operations over a framework.
 5. **Explicit lifecycle.** Opening and closing resources are async,
@@ -55,10 +56,12 @@ setting a URL. It must not require library or application code changes.
   reconnection, and resubscription.
 - refc and ORC support.
 - Reusable backend contract tests.
+- Opt-in backend-neutral cache coalescing and lifecycle over an injected
+  `KvStore`.
 
 ### 3.2 Explicitly excluded
 
-- Cache invalidation policies, serialization, namespacing, or domain schemas.
+- Domain cache invalidation policies, serialization, namespacing, or schemas.
 - Distributed locks, queues, rate limiters, streams, and transactions.
 - Redis Cluster, Sentinel, RESP3, client-side caching, and Lua.
 - Redis persistence or deployment management.
@@ -221,6 +224,9 @@ must redact credentials and command payloads.
 - Repeated `close` succeeds and terminates subscriptions and background tasks.
 - Concurrent `close` calls join one cancellation-shielded cleanup task. A
   cancelled caller cannot cancel transport, worker, or observer cleanup.
+- A callback that awaits `close` receives a caller-specific handoff so it can
+  return; terminal cleanup still waits for that callback task to exit before
+  completing for external callers. Only active caller ancestry is retained.
 - Registering a state observer after terminal close is inert and starts no
   background task.
 
@@ -373,7 +379,9 @@ src/
   redischronos.nim
   redischronos/
     api.nim
+    cache.nim
     errors.nim
+    factories.nim
     options.nim
     memorykv.nim
     memorypubsub.nim
@@ -382,6 +390,7 @@ src/
     redisconnection.nim
     rediskv.nim
     redispubsub.nim
+    redisresolve.nim
 tests/
   tall.nim
   contract/
@@ -389,10 +398,16 @@ tests/
     pubsubcontract.nim
   tmemorykv.nim
   tmemorypubsub.nim
+  tcontractharness.nim
+  tcache.nim
   tresp2.nim
   tredisurl.nim
+  tredisresolve.nim
+  tredisconnection.nim
   trediskv.nim
   tredispubsub.nim
+  tredispubsubfaults.nim
+  tredisoutage.nim
 ```
 
 Create modules only when their TODO becomes active; the layout is a target,
@@ -494,6 +509,16 @@ string-key versioning without imposing a serialization or domain policy.
 Invalidation and version increments advance a per-key fence and join any older
 fill before mutating the backend. Close advances a cache-wide fence before
 joining every owned read, loader, write, waiter dependency, and cleanup task.
-Closing a cache is cancellation-safe and join-idempotent: it rejects new work,
-cancels and joins owned operations, and clears per-key state. The injected
-`KvStore` remains caller-owned.
+If a cancellation-resistant backend write crosses a fence, the cache joins it
+and removes the stale key before terminal cleanup completes. Loader ancestry
+detects same-key recursion even after yields. A loader that initiates close
+receives a caller-specific handoff and then exits before external close callers
+complete. Closing a cache is cancellation-safe and join-idempotent: it rejects
+new work, translates shutdown cancellation to `BackendClosedError`, cancels
+and joins owned operations, and clears per-key state. The injected `KvStore`
+remains caller-owned.
+
+DNS resolution runs off the Chronos event loop in one process-lifetime worker
+per event-loop thread. Its request and result queues are bounded; expired work
+is discarded before or after the blocking lookup, and late results are never
+retained for callers that have already timed out.
