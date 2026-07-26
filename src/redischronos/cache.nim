@@ -24,6 +24,11 @@ type
     keyGeneration: uint64
     invokingLoader: bool
 
+  PhysicalKey = tuple[store: pointer, key: string]
+  PhysicalKeyGate = ref object
+    lock: AsyncLock
+    users: int
+
   Cache* = ref object
     store: KvStore
     options: CacheOptions
@@ -35,6 +40,35 @@ type
     owned: seq[FutureBase]
     activeOperations: int
     closeCallers: seq[Future[void]]
+
+var physicalKeyGates {.threadvar.}: Table[PhysicalKey, PhysicalKeyGate]
+
+proc acquirePhysicalKey(store: KvStore,
+    key: string): Future[PhysicalKeyGate] {.async.} =
+  if physicalKeyGates.len == 0:
+    physicalKeyGates = initTable[PhysicalKey, PhysicalKeyGate]()
+  let identity = (cast[pointer](store), key)
+  let gate = physicalKeyGates.mgetOrPut(
+    identity,
+    PhysicalKeyGate(lock: newAsyncLock())
+  )
+  inc gate.users
+  try:
+    await gate.lock.acquire()
+    return gate
+  except CancelledError:
+    dec gate.users
+    if gate.users == 0 and physicalKeyGates.getOrDefault(identity) == gate:
+      physicalKeyGates.del(identity)
+    raise
+
+proc releasePhysicalKey(store: KvStore, key: string,
+    gate: PhysicalKeyGate) =
+  gate.lock.release()
+  dec gate.users
+  let identity = (cast[pointer](store), key)
+  if gate.users == 0 and physicalKeyGates.getOrDefault(identity) == gate:
+    physicalKeyGates.del(identity)
 
 func defaultCacheOptions*(): CacheOptions =
   CacheOptions(
@@ -141,37 +175,44 @@ proc fill(cache: Cache, key: string, loader: CacheLoader,
     if cache.closed or cache.generation != entry.cacheGeneration or
         cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
       raise newException(BackendClosedError, "cache fill was fenced")
-    let writing =
-      cache.store.set(key, value, cache.options.ttlSeconds)
-    cache.owned.add(writing)
+    let gate = await acquirePhysicalKey(cache.store, key)
     try:
-      await writing
-    except CancelledError:
-      raise
-    except CatchableError:
-      if cache.options.failurePolicy == cfpPropagate:
-        raise
-    finally:
-      cache.owned.keepItIf(it != writing)
-    if cache.closed or cache.generation != entry.cacheGeneration or
-        cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
-      let deleting = cache.store.delete(key)
-      cache.owned.add(deleting)
+      let writing =
+        cache.store.set(key, value, cache.options.ttlSeconds)
+      cache.owned.add(writing)
       try:
-        discard await deleting
+        await writing
+      except CancelledError:
+        if cache.closed or cache.generation != entry.cacheGeneration or
+            cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
+          let deleting = cache.store.delete(key)
+          cache.owned.add(deleting)
+          try:
+            discard await deleting
+          finally:
+            cache.owned.keepItIf(it != deleting)
+          raise newException(BackendClosedError, "cache fill was fenced")
+        raise
+      except CatchableError:
+        if cache.options.failurePolicy == cfpPropagate:
+          raise
       finally:
-        cache.owned.keepItIf(it != deleting)
-      raise newException(BackendClosedError, "cache fill was fenced")
+        cache.owned.keepItIf(it != writing)
+      if cache.closed or cache.generation != entry.cacheGeneration or
+          cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
+        let deleting = cache.store.delete(key)
+        cache.owned.add(deleting)
+        try:
+          discard await deleting
+        finally:
+          cache.owned.keepItIf(it != deleting)
+        raise newException(BackendClosedError, "cache fill was fenced")
+    finally:
+      releasePhysicalKey(cache.store, key, gate)
     return value
   except CancelledError:
     if cache.closed or cache.generation != entry.cacheGeneration or
         cache.keyGenerations.getOrDefault(key) != entry.keyGeneration:
-      let deleting = cache.store.delete(key)
-      cache.owned.add(deleting)
-      try:
-        discard await deleting
-      finally:
-        cache.owned.keepItIf(it != deleting)
       raise newException(BackendClosedError, "cache fill was fenced")
     raise
   finally:
@@ -300,6 +341,9 @@ proc closeOwned(cache: Cache): Future[void] {.async.} =
       tasks.add(operation)
   if tasks.len > 0:
     await allFutures(tasks)
+    for task in tasks:
+      if task.failed and not (task.error of BackendClosedError):
+        raise task.error
   while cache.activeOperations > 0:
     await sleepAsync(0.milliseconds)
   cache.fills.clear()

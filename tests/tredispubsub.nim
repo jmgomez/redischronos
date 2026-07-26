@@ -266,6 +266,21 @@ when defined(redisIntegration):
         check bus.closeCallerCountForTest() == 0
       waitFor exercise()
 
+    test "terminal state observer can unconditionally await close":
+      proc exercise() {.async.} =
+        let bus = await openPubSub(getEnv("REDIS_TEST_URL"))
+        var states: seq[ConnectionState]
+        bus.onStateChange(
+          proc(state: ConnectionState): Future[void] {.async.} =
+            states.add(state)
+            await sleepAsync(0.milliseconds)
+            await bus.close()
+        )
+        await bus.close().wait(200.milliseconds)
+        check states == @[csConnected, csClosed]
+        check bus.closeCallerCountForTest() == 0
+      waitFor exercise()
+
     test "bounded queues and retiring workers remain owned through close":
       proc exercise() {.async.} =
         var options = defaultBackendOptions()

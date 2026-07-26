@@ -43,6 +43,7 @@ type
     stateQueue: Deque[ConnectionState]
     stateWorker: Future[void]
     stateHandlerTask: Future[void]
+    terminalObserverActive: bool
     rng: Rand
     closeTask: Future[void]
     closeCallers: seq[Future[void]]
@@ -203,6 +204,7 @@ proc observeStates(bus: RedisPubSub) {.async.} =
     let state = bus.stateQueue.popFirst()
     if bus.currentStateHandler != nil:
       try:
+        bus.terminalObserverActive = state == csClosed
         bus.stateHandlerTask = bus.currentStateHandler(state)
         await bus.stateHandlerTask
       except CancelledError:
@@ -211,6 +213,7 @@ proc observeStates(bus: RedisPubSub) {.async.} =
         discard
       finally:
         bus.stateHandlerTask = nil
+        bus.terminalObserverActive = false
 
 proc notifyState(bus: RedisPubSub, state: ConnectionState) =
   bus.stateQueue.addLast(state)
@@ -759,6 +762,10 @@ proc ensureClose(bus: RedisPubSub) =
 
 method close*(bus: RedisPubSub): Future[void] =
   bus.ensureClose()
+  if bus.terminalObserverActive:
+    let handedOff = newFuture[void]("Redis terminal observer close handoff")
+    handedOff.complete()
+    return handedOff
   let caller = newFuture[void](
     "Redis Pub/Sub close caller",
     {FutureFlag.OwnCancelSchedule}

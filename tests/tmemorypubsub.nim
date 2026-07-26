@@ -241,3 +241,18 @@ suite "memory Pub/Sub internals":
         await bus.close()
       check bus.closeCallerCountForTest() == 0
     waitFor exercise()
+
+  test "terminal state observer can unconditionally await close":
+    proc exercise() {.async.} =
+      let bus = await openPubSub()
+      var states: seq[ConnectionState]
+      bus.onStateChange(
+        proc(state: ConnectionState): Future[void] {.async.} =
+          states.add(state)
+          await sleepAsync(0.milliseconds)
+          await bus.close()
+      )
+      await bus.close().wait(100.milliseconds)
+      check states == @[csConnected, csClosed]
+      check bus.closeCallerCountForTest() == 0
+    waitFor exercise()

@@ -15,6 +15,8 @@ type
     values: Table[string, string]
     writeStarted: Future[void]
     writeRelease: Future[void]
+    setCalls: int
+    failDelete: bool
   CancelledStore = ref object of KvStore
   CancelledWriteStore = ref object of KvStore
 
@@ -54,11 +56,15 @@ method get(store: LateWriteStore,
 
 method set(store: LateWriteStore, key, value: string,
     ttlSeconds = 0): Future[void] {.async.} =
-  store.writeStarted.complete()
-  await store.writeRelease.noCancel()
+  inc store.setCalls
+  if store.setCalls == 1:
+    store.writeStarted.complete()
+    await store.writeRelease.noCancel()
   store.values[key] = value
 
 method delete(store: LateWriteStore, key: string): Future[bool] {.async.} =
+  if store.failDelete:
+    raise newException(BackendConnectionError, "injected cleanup failure")
   result = store.values.hasKey(key)
   store.values.del(key)
 
@@ -497,4 +503,60 @@ suite "cache fencing and ownership":
       check (await store.get("replacement")) == some("new")
       await cache.close()
       await store.close()
+    waitFor exercise()
+
+  test "late orphan cleanup cannot delete a shared-store replacement":
+    proc exercise() {.async.} =
+      let writeStarted = newFuture[void]("old physical write started")
+      let writeRelease = newFuture[void]("release old physical write")
+      let store = LateWriteStore(
+        values: initTable[string, string](),
+        writeStarted: writeStarted,
+        writeRelease: writeRelease
+      )
+      var options = defaultCacheOptions()
+      options.cancellationPolicy = ccpCancelOrphaned
+      let oldCache = newCache(store, options)
+      let newCache = newCache(store, options)
+      let oldLoader: CacheLoader =
+        proc(key: string): Future[string] {.async.} = return "old"
+      let newLoader: CacheLoader =
+        proc(key: string): Future[string] {.async.} = return "new"
+      let oldWaiter = oldCache.getOrLoad("shared-replacement", oldLoader)
+      await writeStarted
+      oldWaiter.cancelSoon()
+      expect CancelledError:
+        discard await oldWaiter
+      let replacement = newCache.getOrLoad("shared-replacement", newLoader)
+      await sleepAsync(chronos.milliseconds(5))
+      check not replacement.finished
+      writeRelease.complete()
+      check (await replacement) == "new"
+      check (await store.get("shared-replacement")) == some("new")
+      await oldCache.close()
+      await newCache.close()
+    waitFor exercise()
+
+  test "close exposes compensating delete failure":
+    proc exercise() {.async.} =
+      let writeStarted = newFuture[void]("failed cleanup write started")
+      let writeRelease = newFuture[void]("failed cleanup write release")
+      let store = LateWriteStore(
+        values: initTable[string, string](),
+        writeStarted: writeStarted,
+        writeRelease: writeRelease,
+        failDelete: true
+      )
+      let cache = newCache(store)
+      let loader: CacheLoader =
+        proc(key: string): Future[string] {.async.} = return "stale"
+      let filling = cache.getOrLoad("cleanup-failure", loader)
+      await writeStarted
+      let closing = cache.close()
+      writeRelease.complete()
+      expect BackendConnectionError:
+        await closing
+      check (await store.get("cleanup-failure")) == some("stale")
+      expect BackendClosedError:
+        discard await filling
     waitFor exercise()

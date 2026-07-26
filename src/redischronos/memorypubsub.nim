@@ -27,6 +27,7 @@ type
     stateQueue: Deque[ConnectionState]
     stateWorker: Future[void]
     stateHandlerTask: Future[void]
+    terminalObserverActive: bool
     closeTask: Future[void]
     closeCallers: seq[Future[void]]
 
@@ -103,6 +104,7 @@ proc observeStates(bus: InProcessPubSub) {.async.} =
     let state = bus.stateQueue.popFirst()
     if bus.currentStateHandler != nil:
       try:
+        bus.terminalObserverActive = state == csClosed
         bus.stateHandlerTask = bus.currentStateHandler(state)
         await bus.stateHandlerTask
       except CancelledError:
@@ -111,6 +113,7 @@ proc observeStates(bus: InProcessPubSub) {.async.} =
         discard
       finally:
         bus.stateHandlerTask = nil
+        bus.terminalObserverActive = false
 
 proc notifyState(bus: InProcessPubSub, state: ConnectionState) =
   bus.stateQueue.addLast(state)
@@ -217,6 +220,10 @@ proc ensureClose(bus: InProcessPubSub) =
 
 method close*(bus: InProcessPubSub): Future[void] =
   bus.ensureClose()
+  if bus.terminalObserverActive:
+    let handedOff = newFuture[void]("memory terminal observer close handoff")
+    handedOff.complete()
+    return handedOff
   let caller = newFuture[void](
     "memory Pub/Sub close caller",
     {FutureFlag.OwnCancelSchedule}

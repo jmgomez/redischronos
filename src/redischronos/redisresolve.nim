@@ -22,6 +22,8 @@ type
     requests: Channel[ResolverRequest]
     responses: Channel[ResolverResponse]
     delayMilliseconds: Atomic[int]
+    workersCreated: Atomic[int]
+    workersAlive: Atomic[int]
 
 var
   resolverState {.threadvar.}: ptr ResolverWorkerState
@@ -39,20 +41,25 @@ proc resolveWorker(host: string,
     result = @[]
 
 proc resolverLoop(state: ptr ResolverWorkerState) {.thread.} =
-  while true:
-    let request = state.requests.recv()
-    if getMonoTime().ticks >= request.deadlineTicks:
-      continue
-    when defined(test):
-      let delay = state.delayMilliseconds.load()
-      if delay > 0:
-        sleep(delay)
-    let addresses = resolveWorker(request.host, request.port)
-    if getMonoTime().ticks < request.deadlineTicks:
-      discard state.responses.trySend(ResolverResponse(
-        id: request.id,
-        addresses: addresses
-      ))
+  discard state.workersCreated.fetchAdd(1)
+  discard state.workersAlive.fetchAdd(1)
+  try:
+    while true:
+      let request = state.requests.recv()
+      if getMonoTime().ticks >= request.deadlineTicks:
+        continue
+      when defined(test):
+        let delay = state.delayMilliseconds.load()
+        if delay > 0:
+          sleep(delay)
+      let addresses = resolveWorker(request.host, request.port)
+      if getMonoTime().ticks < request.deadlineTicks:
+        discard state.responses.trySend(ResolverResponse(
+          id: request.id,
+          addresses: addresses
+        ))
+  finally:
+    discard state.workersAlive.fetchSub(1)
 
 proc ensureResolverStarted(): ptr ResolverWorkerState =
   if resolverState == nil:
@@ -126,7 +133,10 @@ when defined(test):
   proc resolverStateForTest*(): (int, int, int) =
     let state = ensureResolverStarted()
     (
-      1,
+      state.workersAlive.load(),
       max(state.requests.peek(), 0),
       max(state.responses.peek(), 0)
     )
+
+  proc resolverWorkersCreatedForTest*(): int =
+    ensureResolverStarted().workersCreated.load()

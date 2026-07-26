@@ -351,6 +351,9 @@ cannot run ordinary commands. A `RedisPubSub` therefore owns:
   `csConnected`.
 - Closing cancels reconnect, closes the stream, resolves pending lifecycle
   futures, and emits `csClosed`.
+- A state observer may await `close` for any notification, including
+  `csClosed`; terminal observer re-entry is handed off without joining its own
+  shutdown cycle, while external close callers still join terminal cleanup.
 - Subscription changes during reconnect update desired state and are applied
   after connection.
 - Never claim delivery for messages lost while disconnected.
@@ -510,7 +513,11 @@ Invalidation and version increments advance a per-key fence and join any older
 fill before mutating the backend. Close advances a cache-wide fence before
 joining every owned read, loader, write, waiter dependency, and cleanup task.
 If a cancellation-resistant backend write crosses a fence, the cache joins it
-and removes the stale key before terminal cleanup completes. Loader ancestry
+and removes the stale key before terminal cleanup completes. Physical
+set/compensation for the same injected store object and key is serialized
+across cache instances, so an old fill cannot delete a replacement value.
+Terminal compensation failures fail close with their typed backend error;
+close never reports success while a known stale write remains. Loader ancestry
 detects same-key recursion even after yields. A loader that initiates close
 receives a caller-specific handoff and then exits before external close callers
 complete. Closing a cache is cancellation-safe and join-idempotent: it rejects
@@ -521,4 +528,5 @@ remains caller-owned.
 DNS resolution runs off the Chronos event loop in one process-lifetime worker
 per event-loop thread. Its request and result queues are bounded; expired work
 is discarded before or after the blocking lookup, and late results are never
-retained for callers that have already timed out.
+retained for callers that have already timed out. Test instrumentation measures
+worker creation and liveness atomically at the production worker boundary.
