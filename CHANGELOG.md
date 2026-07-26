@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.3 — 2026-07-26
+
+- Serialize cache compensation across cache instances sharing one store and
+  surface terminal compensation failures through the shared close future.
+- Keep unrelated external Pub/Sub close callers joined while a terminal state
+  observer is active.
+- Measure resolver worker creation and liveness across repeated timeout waves.
+- Preserve typed failures and cancellation across asynchronous cleanup on the
+  minimum supported Nim 2.2.0 compiler.
+
 ## 1.1.2 — 2026-07-26
 
 - Make cache shutdown translate internal cancellation, detect yielded

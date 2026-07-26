@@ -17,7 +17,7 @@ import ./tredisoutage
 
 suite "public contracts":
   test "exposes the stable release version":
-    check redischronosVersion == "1.1.2"
+    check redischronosVersion == "1.1.3"
 
   test "default options match the documented contract":
     let options = defaultBackendOptions()

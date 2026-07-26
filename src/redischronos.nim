@@ -1,4 +1,4 @@
-const redischronosVersion* = "1.1.2"
+const redischronosVersion* = "1.1.3"
 
 import redischronos/api
 import redischronos/factories

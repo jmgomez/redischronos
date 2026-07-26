@@ -1,7 +1,7 @@
 import std/[os, strutils]
 
 # Package
-version       = "1.1.2"
+version       = "1.1.3"
 author        = "jmgomez"
 description   = "Chronos-native KV and Pub/Sub with interchangeable memory and Redis backends"
 license       = "MIT"
